@@ -167,8 +167,12 @@ class SegmentationTab(QWidget):
         settings_mgr.get_session_setting("default_sam_model", "Base")
 
         self.sam_model_combo = QComboBox()
-        self.sam_model_combo.addItems(["Base", "Large", "Efficient"])
-        self.sam_model_combo.setToolTip("Large model is slower but slightly more accurate.\nEfficient model is faster but less accurate.")
+        self.sam_model_combo.addItems(["Base", "Large", "Efficient", "SAM 3.1"])
+        self.sam_model_combo.setToolTip(
+            "Large model is slower but slightly more accurate.\n"
+            "Efficient model is faster but less accurate.\n"
+            "SAM 3.1 requires CUDA and authenticated Hugging Face checkpoint access."
+        )
         self.sam_model_btn = QPushButton("Load Model")
         self.sam_model_btn.setEnabled(False) # disabled until video is loaded
 
@@ -396,6 +400,8 @@ class SegmentationTab(QWidget):
             self.sam_model_combo.setCurrentIndex(1)
         elif model == "Efficient":
             self.sam_model_combo.setCurrentIndex(2)
+        elif model == "SAM 3.1":
+            self.sam_model_combo.setCurrentIndex(3)
 
         # Update sliders
         slider_mappings = [
@@ -446,8 +452,10 @@ class MattingTab(QWidget):
         
         model_label = QLabel("Model:")
         self.matany_model_combo = QComboBox()
-        self.matany_model_combo.addItems(["MatAnyone", "MatAnyone2", "VideoMaMa"])
-        self.matany_model_combo.setToolTip("VideoMaMa is higher quality but slower and uses more VRAM.")
+        self.matany_model_combo.addItems(["MatAnyone", "MatAnyone2", "VideoMaMa", "ViTMatte"])
+        self.matany_model_combo.setToolTip(
+            "ViTMatte refines each frame from the original image and trimap."
+        )
 
         res_label = QLabel("Internal Resolution:")
         self.matany_res_combo = QComboBox()
@@ -471,6 +479,54 @@ class MattingTab(QWidget):
         self.combined_mask_checkbox = QCheckBox("Combine All Objects")
         self.combined_mask_checkbox.setToolTip("If checked, all objects will be merged and processed as a single object.")
 
+        self.trimap_auto_checkbox = QCheckBox("Automatic Trimap Width")
+        self.trimap_auto_checkbox.setChecked(
+            settings_mgr.get_session_setting("trimap_auto", True)
+        )
+        self.trimap_fg_spin = QSpinBox()
+        self.trimap_fg_spin.setRange(0, 128)
+        self.trimap_fg_spin.setValue(
+            settings_mgr.get_session_setting("trimap_fg_erode", 8)
+        )
+        self.trimap_bg_spin = QSpinBox()
+        self.trimap_bg_spin.setRange(0, 128)
+        self.trimap_bg_spin.setValue(
+            settings_mgr.get_session_setting("trimap_bg_dilate", 8)
+        )
+        self.vitmatte_margin_label = QLabel("ViTMatte ROI Margin:")
+        self.vitmatte_margin_spin = QSpinBox()
+        self.vitmatte_margin_spin.setRange(0, 1024)
+        self.vitmatte_margin_spin.setSuffix(" px")
+        self.vitmatte_margin_spin.setValue(
+            settings_mgr.get_session_setting("vitmatte_roi_margin", 64)
+        )
+        self.vitmatte_tile_label = QLabel("ViTMatte Tile Size:")
+        self.vitmatte_tile_spin = QSpinBox()
+        self.vitmatte_tile_spin.setRange(256, 4096)
+        self.vitmatte_tile_spin.setSingleStep(128)
+        self.vitmatte_tile_spin.setValue(
+            settings_mgr.get_session_setting("vitmatte_tile_size", 1024)
+        )
+        self.vitmatte_overlap_label = QLabel("Tile Overlap:")
+        self.vitmatte_overlap_spin = QSpinBox()
+        self.vitmatte_overlap_spin.setRange(0, 512)
+        self.vitmatte_overlap_spin.setSingleStep(32)
+        self.vitmatte_overlap_spin.setValue(
+            settings_mgr.get_session_setting("vitmatte_tile_overlap", 128)
+        )
+        trimap_layout = QGridLayout()
+        trimap_layout.addWidget(self.trimap_auto_checkbox, 0, 0, 1, 2)
+        trimap_layout.addWidget(QLabel("FG Erode:"), 1, 0)
+        trimap_layout.addWidget(self.trimap_fg_spin, 1, 1)
+        trimap_layout.addWidget(QLabel("BG Dilate:"), 2, 0)
+        trimap_layout.addWidget(self.trimap_bg_spin, 2, 1)
+        trimap_layout.addWidget(self.vitmatte_margin_label, 3, 0)
+        trimap_layout.addWidget(self.vitmatte_margin_spin, 3, 1)
+        trimap_layout.addWidget(self.vitmatte_tile_label, 4, 0)
+        trimap_layout.addWidget(self.vitmatte_tile_spin, 4, 1)
+        trimap_layout.addWidget(self.vitmatte_overlap_label, 5, 0)
+        trimap_layout.addWidget(self.vitmatte_overlap_spin, 5, 1)
+
         # Connect to save settings when changed
         self.matany_model_combo.currentTextChanged.connect(self._save_model_setting)
         self.matany_res_combo.currentTextChanged.connect(self._save_resolution_setting)
@@ -483,6 +539,12 @@ class MattingTab(QWidget):
         self.combined_mask_checkbox.stateChanged.connect(
             lambda state: settings_mgr.set_session_setting("matany_combined", self.combined_mask_checkbox.isChecked())
         )
+        self.trimap_auto_checkbox.stateChanged.connect(self._save_trimap_settings)
+        self.trimap_fg_spin.valueChanged.connect(self._save_trimap_settings)
+        self.trimap_bg_spin.valueChanged.connect(self._save_trimap_settings)
+        self.vitmatte_margin_spin.valueChanged.connect(self._save_trimap_settings)
+        self.vitmatte_tile_spin.valueChanged.connect(self._save_trimap_settings)
+        self.vitmatte_overlap_spin.valueChanged.connect(self._save_trimap_settings)
 
         model_layout.addWidget(model_label)
         model_layout.addWidget(self.matany_model_combo)
@@ -502,6 +564,7 @@ class MattingTab(QWidget):
         processing_layout.addLayout(overlap_layout)
         processing_layout.addLayout(chunk_layout)
         processing_layout.addWidget(self.combined_mask_checkbox)
+        processing_layout.addLayout(trimap_layout)
         layout.addWidget(processing_group)
 
         # Parameters
@@ -646,6 +709,28 @@ class MattingTab(QWidget):
             self.overlap_combo.setVisible(False)
             self.chunk_label.setVisible(False)
             self.chunk_combo.setVisible(False)
+        is_vitmatte = value == "ViTMatte"
+        self.vitmatte_margin_label.setVisible(is_vitmatte)
+        self.vitmatte_margin_spin.setVisible(is_vitmatte)
+        self.vitmatte_tile_label.setVisible(is_vitmatte)
+        self.vitmatte_tile_spin.setVisible(is_vitmatte)
+        self.vitmatte_overlap_label.setVisible(is_vitmatte)
+        self.vitmatte_overlap_spin.setVisible(is_vitmatte)
+
+    def _save_trimap_settings(self, _value=None):
+        settings_mgr = get_settings_manager()
+        automatic = self.trimap_auto_checkbox.isChecked()
+        settings_mgr.set_session_setting("trimap_auto", automatic)
+        settings_mgr.set_session_setting("trimap_fg_erode", self.trimap_fg_spin.value())
+        settings_mgr.set_session_setting("trimap_bg_dilate", self.trimap_bg_spin.value())
+        settings_mgr.set_session_setting("vitmatte_roi_margin", self.vitmatte_margin_spin.value())
+        settings_mgr.set_session_setting("vitmatte_tile_size", self.vitmatte_tile_spin.value())
+        overlap = min(
+            self.vitmatte_overlap_spin.value(), self.vitmatte_tile_spin.value() - 1
+        )
+        settings_mgr.set_session_setting("vitmatte_tile_overlap", overlap)
+        self.trimap_fg_spin.setEnabled(not automatic)
+        self.trimap_bg_spin.setEnabled(not automatic)
 
     def _save_resolution_setting(self, value):
         """Save resolution combo box value to session settings"""
@@ -679,12 +764,18 @@ class MattingTab(QWidget):
             self.overlap_combo.setVisible(False)
             self.chunk_label.setVisible(False)
             self.chunk_combo.setVisible(False)
-        else:
+        elif model == "VideoMaMa":
             self.matany_model_combo.setCurrentIndex(2)
             self.overlap_label.setVisible(True) # overlap setting is visible for VideoMaMa
             self.overlap_combo.setVisible(True)
             self.chunk_label.setVisible(True) # chunk setting is visible for VideoMaMa
             self.chunk_combo.setVisible(True)
+        else:
+            self.matany_model_combo.setCurrentText("ViTMatte")
+            self.overlap_label.setVisible(False)
+            self.overlap_combo.setVisible(False)
+            self.chunk_label.setVisible(False)
+            self.chunk_combo.setVisible(False)
 
         # Load overlap value
         overlap = settings_mgr.get_session_setting("matany_overlap", 2)
@@ -707,6 +798,26 @@ class MattingTab(QWidget):
         # Load combined checkbox
         combined = settings_mgr.get_session_setting("matany_combined", False)
         self.combined_mask_checkbox.setChecked(combined)
+        self.trimap_auto_checkbox.setChecked(
+            settings_mgr.get_session_setting("trimap_auto", True)
+        )
+        self.trimap_fg_spin.setValue(
+            settings_mgr.get_session_setting("trimap_fg_erode", 8)
+        )
+        self.trimap_bg_spin.setValue(
+            settings_mgr.get_session_setting("trimap_bg_dilate", 8)
+        )
+        self.vitmatte_margin_spin.setValue(
+            settings_mgr.get_session_setting("vitmatte_roi_margin", 64)
+        )
+        self.vitmatte_tile_spin.setValue(
+            settings_mgr.get_session_setting("vitmatte_tile_size", 1024)
+        )
+        self.vitmatte_overlap_spin.setValue(
+            settings_mgr.get_session_setting("vitmatte_tile_overlap", 128)
+        )
+        self._save_trimap_settings()
+        self._save_model_setting(model)
 
         # Update gamma slider
         gamma = settings_mgr.get_session_setting("matany_gamma", 1.0)
@@ -1669,7 +1780,8 @@ class MainWindow(QMainWindow):
         view_controls_layout.addWidget(QLabel("View:"))
         self.view_combo = QComboBox()
         self.view_combo.addItems([
-            "Segmentation-Edit", "Segmentation-Matte", "Segmentation-BGcolor", "Matting-Matte", "Matting-BGcolor", "ObjectRemoval"
+            "Segmentation-Edit", "Segmentation-Matte", "Segmentation-BGcolor",
+            "Trimap-Preview", "Matting-Matte", "Matting-BGcolor", "ObjectRemoval"
         ])
 
         # Always reset the view to "Segmentation-Edit"
@@ -1926,11 +2038,10 @@ class MainWindow(QMainWindow):
         elif action == 'clear_object':
             object_id = kwargs.get('object_id')
             if object_id is not None:
-                # Call predictor remove_object
-                self.sam_manager.predictor.remove_object(self.sam_manager.inference_state, object_id)
+                self.sam_manager.remove_object(object_id, self.frame_slider.value())
             if len(self.point_manager.points) == 0:
                 # Reset predictor when no points remain
-                self.sam_manager.predictor.reset_state(self.sam_manager.inference_state)
+                self.sam_manager.reset_state()
                 self.sam_manager.propagated = False
                 self.matany_manager.propagated = False
                 self.removal_manager.propagated = False
@@ -2343,17 +2454,26 @@ class MainWindow(QMainWindow):
             return
 
         if count > 0:  
-            #load models
             print(f"Loading {matting_model} model...")
             QApplication.processEvents()
-            self.sam_manager.offload_model_to_cpu()
-            if self.matany_manager.BACKEND != matting_model: # if the existing matting manager backend is wrong, create a new one
-                self.matany_manager = matting.create_matting_manager()
-            if not self.matany_manager.load_matting_model(parent_window=self): # load matting model
-                print(f"Failed to load { matting_model} model")
-                return
-            QApplication.processEvents()
+            suspended_sam31 = self.sam_manager.sam31_backend is not None
+            if suspended_sam31:
+                # SAM 3.1 cannot be CPU-offloaded. Fully release it before a
+                # matting stage so both large models never occupy VRAM together.
+                self.sam_manager.unload_segmentation_model()
+            else:
+                self.sam_manager.offload_model_to_cpu()
+            matting_loaded = False
             try:
+                if self.matany_manager.BACKEND != matting_model:
+                    self.matany_manager = matting.create_matting_manager()
+                matting_loaded = bool(
+                    self.matany_manager.load_matting_model(parent_window=self)
+                )
+                if not matting_loaded:
+                    print(f"Failed to load {matting_model} model")
+                    return
+                QApplication.processEvents()
                 self.matany_manager.run_matting(self.point_manager.points, parent_window=self, combined=combined)
             except Exception as e:
                 if "out of memory" in str(e):
@@ -2365,8 +2485,16 @@ class MainWindow(QMainWindow):
                 self._update_current_frame_display()
                 QApplication.processEvents()
                 self.settings_mgr.save_session_settings()
-                self.matany_manager.unload_matting_model()
-                self.sam_manager.load_model_to_device()
+                if matting_loaded:
+                    self.matany_manager.unload_matting_model()
+                if suspended_sam31:
+                    if self.sam_manager.load_segmentation_model("SAM 3.1", parent_window=self):
+                        self.sam_manager.initialize_predictor()
+                        self.sam_manager.replay_points(
+                            self.point_manager.get_all_points()
+                        )
+                else:
+                    self.sam_manager.load_model_to_device()
         else:
             print("Points must be added on the Segmentation tab before matting")
 

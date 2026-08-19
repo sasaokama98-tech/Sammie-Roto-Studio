@@ -21,6 +21,8 @@ from sammie.duplicate_frame_handler import replace_similar_matte_frames
 from sammie.settings_manager import get_settings_manager
 from sammie.gui_widgets import show_message_dialog
 from sammie.model_downloader import ensure_models
+from sammie.sam31_backend import Sam31Backend, Sam31UnavailableError
+from sammie.trimap import TrimapConfig, generate_trimap, render_trimap_preview, save_trimap
 
 smoothing_model = None  # global variable needed to avoid complexity of passing the model around
 
@@ -34,6 +36,7 @@ class SamManager:
         self.model = None
         self.loaded_model_name = None
         self.predictor = None
+        self.sam31_backend = None
         self.inference_state = None
         self.propagated = False  # whether we have propagated the masks
         self.deduplicated = False  # whether we have deduplicated the masks
@@ -59,7 +62,21 @@ class SamManager:
             sam_model = model
         core.DeviceManager.clear_cache()
         device = core.DeviceManager.get_device()
-        if sam_model == "Large":
+        if sam_model == "SAM 3.1":
+            try:
+                self.sam31_backend = Sam31Backend(device, core.get_frame_extension())
+                self.predictor = self.sam31_backend.load()
+            except Sam31UnavailableError as exc:
+                self.sam31_backend = None
+                self.predictor = None
+                print(str(exc))
+                if parent_window is not None:
+                    QMessageBox.warning(parent_window, "SAM 3.1 unavailable", str(exc))
+                return False
+            self.loaded_model_name = sam_model
+            print("Loaded SAM 3.1 model")
+            return True
+        elif sam_model == "Large":
             print("Loaded SAM2 Large model")
             checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
             model_cfg = "./configs/sam2.1/sam2.1_hiera_l.yaml"
@@ -82,8 +99,12 @@ class SamManager:
 
     def unload_segmentation_model(self):
         """Unload the SAM model and clear cache"""
+        if self.sam31_backend is not None:
+            self.sam31_backend.unload()
+            self.sam31_backend = None
         self.predictor = None
         self.inference_state = None
+        self.loaded_model_name = None
         core.DeviceManager.clear_cache()
         print("Unloaded Segmentation model")
 
@@ -94,6 +115,9 @@ class SamManager:
             return  # Already on CPU, nothing to do
 
         if self.predictor is not None:
+            if self.sam31_backend is not None:
+                print("SAM 3.1 CPU offload is not supported; unload the model to free VRAM")
+                return
             self.predictor.to('cpu')
             core.DeviceManager.clear_cache()
 
@@ -104,9 +128,16 @@ class SamManager:
             return  # Already on CPU, nothing to do
 
         if self.predictor is not None:
+            if self.sam31_backend is not None:
+                return
             self.predictor.to(device)
 
     def initialize_predictor(self):
+        if self.sam31_backend is not None:
+            self.sam31_backend.frame_extension = core.get_frame_extension().lower()
+            self.sam31_backend.start_session(core.frames_dir)
+            self.inference_state = {"session_id": self.sam31_backend.session_id}
+            return
         self.inference_state = self.predictor.init_state(
             video_path=core.frames_dir, async_loading_frames=True, offload_video_to_cpu=True
         )
@@ -115,6 +146,16 @@ class SamManager:
         extension = core.get_frame_extension()
         frame_filename = os.path.join(core.frames_dir, f"{frame_number:05d}.{extension}")
         if os.path.exists(frame_filename):
+            if self.sam31_backend is not None:
+                masks = self.sam31_backend.add_points(
+                    frame_number, object_id, input_points, input_labels
+                )
+                out_obj_ids = self._save_masks(frame_number, masks)
+                self._notify(
+                    'segmentation_complete', frame=frame_number,
+                    object_id=object_id, out_obj_ids=out_obj_ids
+                )
+                return
 
             # Remove the object from the inference state
             obj_idx = self.inference_state["obj_id_to_idx"].get(object_id)
@@ -133,13 +174,11 @@ class SamManager:
                 points=input_points,
                 labels=input_labels,
             )
-            # Save the segmentation masks
-            for i, out_obj_id in enumerate(out_obj_ids):
-                mask_filename = os.path.join(core.mask_dir, f"{frame_number:05d}", f"{out_obj_id}.png")
-                mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-                mask = (mask * 255).astype(np.uint8)
-                os.makedirs(os.path.dirname(mask_filename), exist_ok=True)
-                cv2.imwrite(mask_filename, mask)
+            masks = [
+                (out_obj_id, (out_mask_logits[i] > 0.0).cpu().numpy().squeeze())
+                for i, out_obj_id in enumerate(out_obj_ids)
+            ]
+            self._save_masks(frame_number, masks)
 
             # Notify that segmentation is complete
             self._notify('segmentation_complete', frame=frame_number, object_id=object_id, out_obj_ids=out_obj_ids)
@@ -148,6 +187,32 @@ class SamManager:
         """Run a preview using the real video predictor, then revert the state."""
         if self.predictor is None or self.inference_state is None:
             return None
+        if self.sam31_backend is not None:
+            existing = [
+                p for p in all_points
+                if p['frame'] == frame_number and p['object_id'] == object_id
+            ]
+            preview_points = np.array(
+                [[p['x'], p['y']] for p in existing] + [[preview_x, preview_y]],
+                dtype=np.float32,
+            )
+            preview_labels = np.array(
+                [1 if p['positive'] else 0 for p in existing] + [1 if is_positive else 0],
+                dtype=np.int32,
+            )
+            try:
+                masks = self.sam31_backend.add_points(
+                    frame_number, object_id, preview_points, preview_labels
+                )
+                preview_mask = next(
+                    ((mask.astype(np.uint8) * 255) for oid, mask in masks if oid == object_id),
+                    None,
+                )
+                self._replay_sam31_points(all_points, save_masks=False)
+                return preview_mask
+            except Exception as exc:
+                print(f"SAM 3.1 preview error: {exc}")
+                return None
         try:
             existing = [p for p in all_points
                         if p['frame'] == frame_number and p['object_id'] == object_id]
@@ -197,6 +262,10 @@ class SamManager:
 
     def replay_points(self, points_list):
         """Replay all points incrementally to rebuild masks."""
+        if self.sam31_backend is not None:
+            self._replay_sam31_points(points_list, save_masks=True)
+            self._notify('replay_complete')
+            return
         frame_count = core.VideoInfo.total_frames
         self.predictor.reset_state(self.inference_state)
 
@@ -228,19 +297,47 @@ class SamManager:
                         print(f"Error during prediction for frame {frame_number}, object {object_id}, point {i}: {e}")
                         continue
 
-                # Save masks only after the final point for this object
-                for j, out_obj_id in enumerate(out_obj_ids):
-                    mask_filename = os.path.join(core.mask_dir, f"{frame_number:05d}", f"{out_obj_id}.png")
-                    mask = (out_mask_logits[j] > 0.0).cpu().numpy().squeeze()
-                    mask = (mask * 255).astype(np.uint8)
-                    try:
-                        os.makedirs(os.path.dirname(mask_filename), exist_ok=True)
-                        cv2.imwrite(mask_filename, mask)
-                    except Exception as e:
-                        print(f"Error saving mask for frame {frame_number}, object {out_obj_id}: {e}")
+                masks = [
+                    (out_obj_id, (out_mask_logits[j] > 0.0).cpu().numpy().squeeze())
+                    for j, out_obj_id in enumerate(out_obj_ids)
+                ]
+                self._save_masks(frame_number, masks)
 
         self._notify('replay_complete')
 
+    def _replay_sam31_points(self, points_list, save_masks=True):
+        self.sam31_backend.reset()
+        grouped = {}
+        for point in points_list:
+            key = (point['frame'], point['object_id'])
+            grouped.setdefault(key, []).append(point)
+        for (frame_number, object_id), points in sorted(grouped.items()):
+            coordinates = np.array([[p['x'], p['y']] for p in points], dtype=np.float32)
+            labels = np.array([1 if p['positive'] else 0 for p in points], dtype=np.int32)
+            masks = self.sam31_backend.add_points(
+                frame_number, object_id, coordinates, labels
+            )
+            if save_masks:
+                self._save_masks(frame_number, masks)
+
+    def _save_masks(self, frame_number, masks):
+        """Persist normalized backend masks and their generated trimaps."""
+        object_ids = []
+        for object_id, raw_mask in masks:
+            object_id = int(object_id)
+            mask = (np.asarray(raw_mask) > 0).astype(np.uint8) * 255
+            mask_filename = os.path.join(
+                core.mask_dir, f"{frame_number:05d}", f"{object_id}.png"
+            )
+            trimap_filename = os.path.join(
+                core.trimap_dir, f"{frame_number:05d}", f"{object_id}.png"
+            )
+            os.makedirs(os.path.dirname(mask_filename), exist_ok=True)
+            if not cv2.imwrite(mask_filename, mask):
+                raise OSError(f"Failed to write segmentation mask: {mask_filename}")
+            save_trimap(mask, trimap_filename)
+            object_ids.append(object_id)
+        return object_ids
 
     def _propagate(self, parent_window, start_frame_idx, max_frame_num_to_track, reverse=False,
                     show_progress=True):
@@ -274,16 +371,27 @@ class SamManager:
         last_frame_idx = None
         cancelled = False
 
-        for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(
-                self.inference_state, start_frame_idx=start_frame_idx,
-                max_frame_num_to_track=max_frame_num_to_track, reverse=reverse):
-            for i, out_obj_id in enumerate(out_obj_ids):
-                mask_filename = os.path.join(core.mask_dir, f"{out_frame_idx:05d}", f"{out_obj_id}.png")
-                mask = (out_mask_logits[i] > 0.0).cpu().numpy().squeeze()
-                mask = (mask * 255).astype(np.uint8)
-                os.makedirs(os.path.dirname(mask_filename), exist_ok=True)
-                cv2.imwrite(mask_filename, mask)
+        if self.sam31_backend is not None:
+            propagation = self.sam31_backend.propagate(
+                start_frame_idx, max_frame_num_to_track, reverse
+            )
+        else:
+            propagation = (
+                (
+                    frame_idx,
+                    [
+                        (object_id, (mask_logits[i] > 0.0).cpu().numpy().squeeze())
+                        for i, object_id in enumerate(object_ids)
+                    ],
+                )
+                for frame_idx, object_ids, mask_logits in self.predictor.propagate_in_video(
+                    self.inference_state, start_frame_idx=start_frame_idx,
+                    max_frame_num_to_track=max_frame_num_to_track, reverse=reverse
+                )
+            )
 
+        for out_frame_idx, masks in propagation:
+            self._save_masks(out_frame_idx, masks)
             last_frame_idx = out_frame_idx
 
             if progress_dialog is not None:
@@ -401,12 +509,30 @@ class SamManager:
         if os.path.exists(core.mask_dir):
             shutil.rmtree(core.mask_dir)
         os.makedirs(core.mask_dir)
-        self.predictor.reset_state(self.inference_state)
+        if os.path.exists(core.trimap_dir):
+            shutil.rmtree(core.trimap_dir)
+        os.makedirs(core.trimap_dir)
+        if self.sam31_backend is not None:
+            self.sam31_backend.reset()
+        else:
+            self.predictor.reset_state(self.inference_state)
         core.DeviceManager.clear_cache()
         if self.propagated:
             print("Tracking data cleared")
         self.propagated = False
         self.deduplicated = False
+
+    def remove_object(self, object_id, frame_number=0):
+        if self.sam31_backend is not None:
+            return self.sam31_backend.remove_object(object_id, frame_number)
+        return self.predictor.remove_object(self.inference_state, object_id)
+
+    def reset_state(self):
+        if self.sam31_backend is not None:
+            return self.sam31_backend.reset()
+        if self.predictor is not None and self.inference_state is not None:
+            return self.predictor.reset_state(self.inference_state)
+        return None
 
 
 # .........................................................................................
@@ -457,6 +583,8 @@ def update_image(slider_value, view_options, points, return_numpy=False, object_
         return _handle_matting_bgcolor_view(slider_value, view_options, points, return_numpy, object_id_filter)
     elif view_mode == "Matting-Alpha":
         return _handle_matting_alpha_view(slider_value, view_options, points, return_numpy, object_id_filter)
+    elif view_mode == "Trimap-Preview":
+        return _handle_trimap_preview_view(slider_value, points, return_numpy, object_id_filter)
     elif view_mode == "ObjectRemoval":
         return _handle_object_removal_view(slider_value, view_options, points, return_numpy, object_id_filter)
     elif view_mode == "None":
@@ -680,6 +808,39 @@ def _handle_matting_alpha_view(frame_number, view_options, points, return_numpy=
         return _convert_to_qpixmap(image_rgba)
 
 
+def _handle_trimap_preview_view(
+    frame_number, points, return_numpy=False, object_id_filter=None
+):
+    """Overlay the current generated trimap classes on the source frame."""
+
+    image = core.load_base_frame(frame_number)
+    if image is None:
+        return None
+    mask = core.load_masks_for_frame(
+        frame_number,
+        points,
+        return_combined=True,
+        object_id_filter=object_id_filter,
+    )
+    if mask is None:
+        return image if return_numpy else _convert_to_qpixmap(image)
+
+    settings_mgr = get_settings_manager()
+    if settings_mgr.get_session_setting("trimap_auto", True):
+        config = TrimapConfig()
+    else:
+        config = TrimapConfig(
+            erode_width=settings_mgr.get_session_setting("trimap_fg_erode", 8),
+            dilate_width=settings_mgr.get_session_setting("trimap_bg_dilate", 8),
+        )
+    trimap = generate_trimap(core.apply_mask_postprocessing(mask), config)
+
+    preview = render_trimap_preview(image, trimap)
+    if return_numpy:
+        return preview
+    return _convert_to_qpixmap(preview)
+
+
 def _handle_object_removal_view(frame_number, view_options, points, return_numpy=False, object_id_filter=None):
     """Handle Object Removal view"""
     image = load_removal_frame(frame_number)
@@ -824,6 +985,7 @@ def load_video(video_file, parent_window):
         shutil.rmtree(core.temp_dir)
     os.makedirs(core.frames_dir)
     os.makedirs(core.mask_dir)
+    os.makedirs(core.trimap_dir)
     os.makedirs(core.matting_dir)
     print(f"Loading video: {video_file}")
 
@@ -1023,6 +1185,7 @@ def load_image_sequence(image_path, parent_window):
         shutil.rmtree(core.temp_dir)
     os.makedirs(core.frames_dir)
     os.makedirs(core.mask_dir)
+    os.makedirs(core.trimap_dir)
     os.makedirs(core.matting_dir)
 
     print(f"Loading {'image sequence' if len(files_to_load) > 1 else 'image'}: {len(files_to_load)} file(s)")

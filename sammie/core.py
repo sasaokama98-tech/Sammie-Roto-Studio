@@ -13,6 +13,7 @@ from sammie.settings_manager import get_settings_manager
 temp_dir = "temp"
 frames_dir = os.path.join(temp_dir, "frames")
 mask_dir = os.path.join(temp_dir, "masks")
+trimap_dir = os.path.join(temp_dir, "trimaps")
 backup_dir = os.path.join(temp_dir, "masks_backup")
 matting_dir = os.path.join(temp_dir, "matting")
 removal_dir = os.path.join(temp_dir, "removal")
@@ -153,8 +154,11 @@ class PointManager:
         if self.points:
             point = self.points.pop()
             mask_filename = os.path.join(mask_dir, f'{point["frame"]:05d}', f'{point["object_id"]}.png')
+            trimap_filename = os.path.join(trimap_dir, f'{point["frame"]:05d}', f'{point["object_id"]}.png')
             if os.path.exists(mask_filename):
                 os.remove(mask_filename)
+            if os.path.exists(trimap_filename):
+                os.remove(trimap_filename)
             settings_mgr = get_settings_manager()
             settings_mgr.save_points(self.points)
             self._notify('remove_last', point=point)
@@ -198,9 +202,12 @@ class PointManager:
             # Remove mask files for this object across all frames
             for point in points_to_remove:
                 mask_filename = os.path.join(mask_dir, f'{point["frame"]:05d}', f'{object_id}.png')
+                trimap_filename = os.path.join(trimap_dir, f'{point["frame"]:05d}', f'{object_id}.png')
                 matting_filename = os.path.join(matting_dir, f'{point["frame"]:05d}', f'{object_id}.png')
                 if os.path.exists(mask_filename):
                     os.remove(mask_filename)
+                if os.path.exists(trimap_filename):
+                    os.remove(trimap_filename)
                 if os.path.exists(matting_filename):
                     os.remove(matting_filename)
             settings_mgr = get_settings_manager()
@@ -287,8 +294,14 @@ def load_masks_for_frame(frame_number, points, return_combined=True, object_id_f
     for object_id in object_ids:
         mask_filename = os.path.join(folder, f"{frame_number:05d}", f"{object_id}.png")
         if os.path.exists(mask_filename):
-            mask = cv2.imread(mask_filename, cv2.IMREAD_GRAYSCALE)
+            mask = cv2.imread(mask_filename, cv2.IMREAD_UNCHANGED)
             if mask is not None:
+                if mask.ndim == 3:
+                    mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+                if mask.dtype == np.uint16:
+                    mask = np.round(mask.astype(np.float32) / 257.0).astype(np.uint8)
+                elif np.issubdtype(mask.dtype, np.floating):
+                    mask = np.round(np.clip(mask, 0.0, 1.0) * 255.0).astype(np.uint8)
                 individual_masks[object_id] = mask
         else:
             # if mask doesn't exist, create a blank frame
@@ -400,8 +413,30 @@ def apply_border_fix(mask, border_size):
 
 def change_gamma(mask, gamma_value):
     inv_gamma = 1.0 / gamma_value
+    if np.issubdtype(mask.dtype, np.floating):
+        return np.power(np.clip(mask, 0.0, 1.0), inv_gamma).astype(mask.dtype)
+    if mask.dtype == np.uint16:
+        normalized = mask.astype(np.float32) / 65535.0
+        return np.round(np.power(normalized, inv_gamma) * 65535.0).astype(np.uint16)
     table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype("uint8")
     return cv2.LUT(mask, table)
+
+
+def load_matte_for_export(frame_number, object_id):
+    """Load one matte as postprocessed float32 without losing 16-bit precision."""
+
+    filename = os.path.join(matting_dir, f"{frame_number:05d}", f"{object_id}.png")
+    mask = cv2.imread(filename, cv2.IMREAD_UNCHANGED)
+    if mask is None:
+        return None
+    if mask.ndim == 3:
+        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    mask = apply_matany_postprocessing(mask)
+    if mask.dtype == np.uint16:
+        return mask.astype(np.float32) / 65535.0
+    if mask.dtype == np.uint8:
+        return mask.astype(np.float32) / 255.0
+    return np.clip(mask.astype(np.float32), 0.0, 1.0)
 
 
 

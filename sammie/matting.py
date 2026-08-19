@@ -10,6 +10,8 @@ from PySide6.QtCore import Qt
 from sammie import core
 from sammie.settings_manager import get_settings_manager
 from sammie.model_downloader import ensure_models
+from sammie.trimap import TrimapConfig, generate_trimap
+from sammie.vitmatte_backend import VitMatteBackend, VitMatteUnavailableError
 
 
 class MattingManager:
@@ -184,6 +186,46 @@ class MattingManager:
 
     def run_matting(self, points_list, parent_window, combined=False):
         raise NotImplementedError("Subclasses must implement run_matting()")
+
+
+class ImageMattingManager(MattingManager):
+    """Base contract for original-resolution per-frame matting backends."""
+
+    def _trimap_config(self):
+        settings_mgr = get_settings_manager()
+        automatic = settings_mgr.get_session_setting("trimap_auto", True)
+        if automatic:
+            return TrimapConfig()
+        return TrimapConfig(
+            erode_width=settings_mgr.get_session_setting("trimap_fg_erode", 8),
+            dilate_width=settings_mgr.get_session_setting("trimap_bg_dilate", 8),
+        )
+
+    def _load_source_mask(self, frame_number, object_ids):
+        union = None
+        for object_id in object_ids:
+            filename = os.path.join(
+                core.mask_dir, f"{frame_number:05d}", f"{object_id}.png"
+            )
+            mask = cv2.imread(filename, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                continue
+            mask = core.apply_mask_postprocessing(mask)
+            union = mask if union is None else np.maximum(union, mask)
+        return union
+
+    def _make_trimap(self, frame_number, output_id, object_ids):
+        mask = self._load_source_mask(frame_number, object_ids)
+        if mask is None or not np.any(mask):
+            return None
+        trimap = generate_trimap(mask, self._trimap_config())
+        filename = os.path.join(
+            core.trimap_dir, f"{frame_number:05d}", f"{output_id}.png"
+        )
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        if not cv2.imwrite(filename, trimap):
+            raise OSError(f"Failed to write trimap: {filename}")
+        return trimap
 
 
 # ---------------------------------------------------------------------------
@@ -619,6 +661,131 @@ class MatAnyManager(MattingManager):
         except Exception as e:
             print(f"Error in backward processing: {e}")
             return False
+
+
+# ---------------------------------------------------------------------------
+# ViTMatte image backend
+# ---------------------------------------------------------------------------
+
+class VitMatteManager(ImageMattingManager):
+    """Original-resolution, ROI-based ViTMatte image matting manager."""
+
+    BACKEND = "ViTMatte"
+
+    def __init__(self):
+        super().__init__()
+        self.backend = None
+
+    def load_matting_model(self, load_to_cpu=False, parent_window=None):
+        device = self._prepare_device(load_to_cpu)
+        self.backend = VitMatteBackend(device)
+        try:
+            self.backend.load()
+        except VitMatteUnavailableError as exc:
+            print(str(exc))
+            self.backend = None
+            return None
+        self.processor = self.backend
+        print(f"Loaded ViTMatte model to {device}")
+        return self.processor
+
+    def unload_matting_model(self):
+        if self.backend is not None:
+            self.backend.unload()
+        self.backend = None
+        self.processor = None
+        gc.collect()
+        core.DeviceManager.clear_cache()
+        print("Unloaded ViTMatte model")
+
+    def run_matting(self, points_list, parent_window, combined=False):
+        if self.backend is None:
+            print("ViTMatte model not loaded")
+            return 0
+
+        settings_mgr = get_settings_manager()
+        start_frame, end_frame, frames_to_process = self._get_frame_range()
+        source_object_ids = sorted({int(point["object_id"]) for point in points_list})
+        if not source_object_ids:
+            return 0
+        jobs = [(0, source_object_ids)] if combined else [
+            (object_id, [object_id]) for object_id in source_object_ids
+        ]
+        total_operations = frames_to_process * len(jobs)
+        progress_dialog, pbar = self._make_progress_dialog(parent_window, total_operations)
+        margin = settings_mgr.get_session_setting("vitmatte_roi_margin", 64)
+        tile_size = settings_mgr.get_session_setting("vitmatte_tile_size", 1024)
+        tile_overlap = settings_mgr.get_session_setting("vitmatte_tile_overlap", 128)
+        display_frequency = settings_mgr.get_app_setting("display_update_frequency", 5)
+        extension = core.get_frame_extension()
+        completed = 0
+        cancelled = False
+
+        os.makedirs(core.matting_dir, exist_ok=True)
+        if combined:
+            for frame_dirname in os.listdir(core.matting_dir):
+                frame_dir = os.path.join(core.matting_dir, frame_dirname)
+                if os.path.isdir(frame_dir):
+                    for filename in os.listdir(frame_dir):
+                        if filename != "0.png":
+                            os.remove(os.path.join(frame_dir, filename))
+
+        try:
+            for output_id, input_ids in jobs:
+                pbar.set_description(f"ViTMatte object {output_id}")
+                for frame_number in range(start_frame, end_frame + 1):
+                    if progress_dialog.wasCanceled():
+                        cancelled = True
+                        break
+                    frame_path = os.path.join(
+                        core.frames_dir, f"{frame_number:05d}.{extension}"
+                    )
+                    bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
+                    if bgr is None:
+                        raise OSError(f"Unable to read frame: {frame_path}")
+                    trimap = self._make_trimap(frame_number, output_id, input_ids)
+                    if trimap is None:
+                        continue
+                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    alpha = self.backend.predict_multi_roi_float(
+                        rgb,
+                        trimap,
+                        margin=margin,
+                        max_tile_size=tile_size,
+                        tile_overlap=tile_overlap,
+                    )
+                    output_path = os.path.join(
+                        core.matting_dir, f"{frame_number:05d}", f"{output_id}.png"
+                    )
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    alpha16 = np.round(np.clip(alpha, 0.0, 1.0) * 65535.0).astype(np.uint16)
+                    if not cv2.imwrite(output_path, alpha16):
+                        raise OSError(f"Failed to write matte: {output_path}")
+
+                    completed += 1
+                    pbar.update(1)
+                    progress_dialog.setValue(int(completed * 100 / max(total_operations, 1)))
+                    if frame_number % display_frequency == 0:
+                        parent_window.frame_slider.setValue(frame_number)
+                    QApplication.processEvents()
+                if cancelled:
+                    break
+        finally:
+            pbar.close()
+            progress_dialog.close()
+            core.DeviceManager.clear_cache()
+
+        self.propagated = (
+            not cancelled
+            and start_frame == 0
+            and end_frame == core.VideoInfo.total_frames - 1
+        )
+        if cancelled:
+            print("ViTMatte matting cancelled")
+            return 0
+        print("ViTMatte matting completed")
+        self._notify('matting_complete')
+        return 1
 
 
 # ---------------------------------------------------------------------------
@@ -1132,6 +1299,8 @@ def create_matting_manager() -> MattingManager:
     """
     settings_mgr = get_settings_manager()
     matting_model = settings_mgr.get_session_setting("matany_model", "MatAnyone")
+    if matting_model == "ViTMatte":
+        return VitMatteManager()
     if matting_model == "VideoMaMa":
         return VideoMaMaManager()
     return MatAnyManager()

@@ -20,6 +20,16 @@ dependencies = [
 
 [project.optional-dependencies]
 cpu   = ["torch==2.11.0", "torchvision==0.26.0"]
+sam31 = [
+    "sam3 @ git+https://github.com/facebookresearch/sam3.git",
+    "pycocotools>=2.0.10",
+    "setuptools>=61,<81",
+    "triton-windows>=3.6,<3.7 ; sys_platform == 'win32'",
+]
+vitmatte = [
+    "transformers>=4.57,<6",
+    "safetensors>=0.4",
+]
 cu126 = ["torch==2.11.0", "torchvision==0.26.0"]
 cu130 = ["torch==2.11.0", "torchvision==0.26.0"]
 rocm  = [
@@ -31,6 +41,10 @@ xpu   = ["torch==2.11.0", "torchvision==0.26.0", "triton-xpu==3.7.0"]
 
 [tool.uv]
 package = false
+# SAM3 currently declares numpy<2 while OpenCV 4.12+ requires numpy>=2.
+# SAM3's inference code is pure Python/torch; retain Sammie's tested OpenCV
+# stack and validate this integration override with the SAM 3.1 GPU smoke test.
+override-dependencies = ["numpy>=2,<2.3"]
 conflicts = [
   [
     { extra = "cpu" },

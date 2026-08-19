@@ -1,0 +1,29 @@
+{
+  "device": "cpu",
+  "model": "hustvl/vitmatte-small-composition-1k",
+  "tile_size": 1024,
+  "tile_overlap": 128,
+  "roi_margin": 64,
+  "results": [
+    {
+      "resolution": "2048x1080",
+      "seconds": 1.022,
+      "fps": 0.9781,
+      "unknown_mae": 0.071007,
+      "process_peak_mib": 1051.1,
+      "roi_count": 2,
+      "known_bg_exact": true,
+      "known_fg_exact": true
+    },
+    {
+      "resolution": "3840x2160",
+      "seconds": 0.916,
+      "fps": 1.0916,
+      "unknown_mae": 0.065546,
+      "process_peak_mib": 1331.9,
+      "roi_count": 2,
+      "known_bg_exact": true,
+      "known_fg_exact": true
+    }
+  ]
+}

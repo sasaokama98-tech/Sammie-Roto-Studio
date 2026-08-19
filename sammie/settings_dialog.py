@@ -124,7 +124,7 @@ class SettingsDialog(QDialog):
 
         # Matting model selection
         self.default_matting_model_combo = QComboBox()
-        self.default_matting_model_combo.addItems(["MatAnyone", "MatAnyone2", "VideoMaMa"])
+        self.default_matting_model_combo.addItems(["MatAnyone", "MatAnyone2", "VideoMaMa", "ViTMatte"])
         self.default_matting_model_combo.setToolTip("VideoMaMa is higher quality but slower and uses more VRAM.")
         mat_layout.addRow("Matting Model:", self.default_matting_model_combo)
 

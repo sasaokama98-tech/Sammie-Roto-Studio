@@ -46,6 +46,12 @@ class ApplicationSettings:
     default_matany_overlap: int = 2
     default_matany_chunk: int = 16
     default_matany_combined: bool = False
+    default_trimap_auto: bool = True
+    default_trimap_fg_erode: int = 8
+    default_trimap_bg_dilate: int = 8
+    default_vitmatte_roi_margin: int = 64
+    default_vitmatte_tile_size: int = 1024
+    default_vitmatte_tile_overlap: int = 128
 
     # Object Removal Processing defaults
     default_removal_method: str = "Minimax-Remover"
@@ -120,6 +126,12 @@ class SessionSettings:
     matany_overlap: int = 2
     matany_chunk: int = 16
     matany_combined: bool = False
+    trimap_auto: bool = True
+    trimap_fg_erode: int = 8
+    trimap_bg_dilate: int = 8
+    vitmatte_roi_margin: int = 64
+    vitmatte_tile_size: int = 1024
+    vitmatte_tile_overlap: int = 128
 
     # Object removal parameters
     inpaint_method: str = "Telea"

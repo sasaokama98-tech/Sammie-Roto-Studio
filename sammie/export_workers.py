@@ -324,10 +324,13 @@ class SequenceExportWorker(BaseExportWorker):
                 
                 # Export each object as a layer
                 for obj_id in all_object_ids:
-                    mask_array = sammie.update_image(
-                        frame_num, view_options, self.points,
-                        return_numpy=True, object_id_filter=obj_id
-                    )
+                    if self.settings.output_type == 'Matting-Matte':
+                        mask_array = core.load_matte_for_export(frame_num, obj_id)
+                    else:
+                        mask_array = sammie.update_image(
+                            frame_num, view_options, self.points,
+                            return_numpy=True, object_id_filter=obj_id
+                        )
                     
                     if mask_array is not None and mask_array.max() > 0:
                         # Convert to grayscale if needed
