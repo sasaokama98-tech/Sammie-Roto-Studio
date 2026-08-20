@@ -41,9 +41,12 @@ legacy runtimes until compatibility tests pass.
   `temp/trimaps/<frame>/<object>.png`.
 - Keep model unload and CUDA cache clearing in the existing lifecycle.
 
-SAM 3.1 checkpoints are gated. The user must request access to `facebook/sam3`
-on Hugging Face and run `hf auth login`. The official SAM 3.1 multiplex path is
-CUDA-only in this integration; SAM2/EfficientTAM remain available elsewhere.
+SAM 3.1 first uses a local checkpoint at
+`checkpoints/sam31/sam3.1_multiplex.pt`. A different location can be selected
+with `SAM31_CHECKPOINT_PATH`. If neither exists, the backend falls back to the
+gated `facebook/sam3.1` Hugging Face repository, which requires accepted access
+and `hf auth login`. The official SAM 3.1 multiplex path is CUDA-only in this
+integration; SAM2/EfficientTAM remain available elsewhere.
 
 Dependency note: official SAM3 metadata currently requires `numpy<2`, while
 Sammie's OpenCV 4.12+ requires `numpy>=2`. The `uv` configuration retains the
@@ -52,10 +55,11 @@ avoids a known Sammie colorspace dependency regression, but the override must
 pass the real SAM 3.1 CUDA smoke test before release packaging.
 
 On native Windows, the extra installs `triton-windows` 3.6.x, matching
-PyTorch 2.11. An unresolved upstream report shows SAM 3.1 multiplex
-propagation can fail with "No available kernel" on Windows RTX 50-series
-cards. This workstation is also RTX 50-series, so Linux/WSL2 is the
-recommended production target until the upstream kernel path is fixed.
+PyTorch 2.11. The Windows PyTorch build can omit Flash SDPA even though SAM
+3.1 multiplex forces its Flash-only context. The backend detects that case
+and limits the SAM 3.1 decoder to cuDNN, Efficient Attention, then Math SDPA.
+This avoids the `No available kernel` propagation failure without changing
+global PyTorch backend selection.
 
 
 ## Phase 2 — ViTMatte image matting (complete)

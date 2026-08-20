@@ -130,24 +130,52 @@ class PointManager:
 
     def remove_point(self, frame, object_id, x, y):
         """Remove a specific point"""
-        before_count = len(self.points)
-        point_to_remove = None
-
         # Find the matching point
         for i, point in enumerate(self.points):
             if (point['frame'] == frame and
                 point['object_id'] == object_id and
                 point['x'] == x and
                 point['y'] == y):
-                point_to_remove = self.points.pop(i)
-                break
-
-        if point_to_remove:
-            settings_mgr = get_settings_manager()
-            settings_mgr.save_points(self.points)
-            self._notify('remove_point', point=point_to_remove)
-            return point_to_remove
+                return self._remove_point_at_index(i)
         return None
+
+    def remove_nearest_point(
+        self,
+        frame,
+        x,
+        y,
+        max_distance,
+        preferred_object_id=None,
+    ):
+        """Remove the nearest point within a scene-space hit radius."""
+        max_distance_squared = float(max_distance) ** 2
+        candidates = []
+        for index, point in enumerate(self.points):
+            if point['frame'] != frame:
+                continue
+            distance_squared = (
+                (float(point['x']) - x) ** 2 + (float(point['y']) - y) ** 2
+            )
+            if distance_squared <= max_distance_squared:
+                preferred_rank = (
+                    0 if point['object_id'] == preferred_object_id else 1
+                )
+                candidates.append(
+                    (distance_squared, preferred_rank, -index, index)
+                )
+
+        if not candidates:
+            return None
+
+        _, _, _, index = min(candidates)
+        return self._remove_point_at_index(index)
+
+    def _remove_point_at_index(self, index):
+        point = self.points.pop(index)
+        settings_mgr = get_settings_manager()
+        settings_mgr.save_points(self.points)
+        self._notify('remove_point', point=point)
+        return point
 
     def remove_last(self):
         """Remove last point"""

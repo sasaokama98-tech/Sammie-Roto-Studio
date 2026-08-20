@@ -12,6 +12,7 @@ This module contains reusable UI components including:
 - FrameSlider: Custom QSlider with visual in/out point indicators and range highlighting
 """
 
+import math
 import os
 import shutil
 import threading
@@ -541,6 +542,7 @@ class ImageViewer(QGraphicsView):
     
     # Add signal for point clicks
     point_clicked = Signal(int, int, bool)  # x, y coordinates, is_positive
+    point_delete_requested = Signal(int, int)  # scene x, y near an existing point
     # Add signal for live preview
     preview_requested = Signal(int, int, bool)  # x, y, is_positive
     preview_cancelled = Signal()
@@ -576,7 +578,12 @@ class ImageViewer(QGraphicsView):
     def _init_variables(self):
         """Initialize state variables"""
         self._is_panning = False
+        self._is_zooming = False
+        self._navigation_button = Qt.NoButton
         self._pan_start = QPointF()
+        self._zoom_drag_start = QPointF()
+        self._zoom_anchor_view = QPointF()
+        self._zoom_drag_start_scale = 1.0
         self.point_editing_enabled = True
         self.original_pixmap = None
         self.fit_scale = 1.0
@@ -684,20 +691,35 @@ class ImageViewer(QGraphicsView):
         self.fit_scale = min(scale_w, scale_h)
         self.min_scale = min(1.0, self.fit_scale)
     
-    def set_zoom(self, scale_factor):
-        """Set the zoom level to a specific scale factor"""
+    def set_zoom(self, scale_factor, anchor_view_pos=None):
+        """Set zoom, optionally keeping a viewport position over the same pixel."""
         if not self.original_pixmap:
             return
         
         # Clamp scale factor to valid range
         scale_factor = max(self.min_scale, min(self.max_scale, scale_factor))
         
-        # Preserve center point during zoom
-        center_before = self.mapToScene(self.viewport().rect().center())
+        if anchor_view_pos is None:
+            center_before = self.mapToScene(self.viewport().rect().center())
+            anchor_scene = None
+        else:
+            anchor_view_pos = QPointF(anchor_view_pos)
+            anchor_scene = self.mapToScene(anchor_view_pos.toPoint())
+
         self.resetTransform()
-        
         self.scale(scale_factor, scale_factor)
-        self.centerOn(center_before)
+
+        if anchor_scene is None:
+            self.centerOn(center_before)
+        else:
+            viewport_center = QPointF(self.viewport().rect().center())
+            center_scene = QPointF(
+                anchor_scene.x()
+                + (viewport_center.x() - anchor_view_pos.x()) / scale_factor,
+                anchor_scene.y()
+                + (viewport_center.y() - anchor_view_pos.y()) / scale_factor,
+            )
+            self.centerOn(center_scene)
         
         self.current_scale = scale_factor
         self._update_status_text()
@@ -751,24 +773,76 @@ class ImageViewer(QGraphicsView):
     # ==================== EVENT HANDLERS ====================
     
     def wheelEvent(self, event: QWheelEvent):
-        """Handle mouse wheel zoom"""
+        """Zoom around the pointer, as in Nuke's Viewer."""
         if not self.original_pixmap:
             return
-        
+
+        if event.angleDelta().y() == 0:
+            event.ignore()
+            return
+
         zoom_factor = 1.5 if event.angleDelta().y() > 0 else 1 / 1.5
         new_scale = self.current_scale * zoom_factor
-        self.set_zoom(new_scale)
+        self.set_zoom(new_scale, event.position())
+        event.accept()
+
+    def _start_pan(self, event: QMouseEvent):
+        self._is_panning = True
+        self._navigation_button = event.button()
+        self._pan_start = event.position()
+        self.setCursor(Qt.ClosedHandCursor)
+        self.setFocus()
+        event.accept()
+
+    def _start_zoom_drag(self, event: QMouseEvent):
+        self._is_zooming = True
+        self._navigation_button = event.button()
+        self._zoom_drag_start = event.position()
+        self._zoom_anchor_view = event.position()
+        self._zoom_drag_start_scale = self.current_scale
+        self.setCursor(Qt.SizeHorCursor)
+        self.setFocus()
+        event.accept()
     
     def mousePressEvent(self, event: QMouseEvent):
-        """Handle mouse press events for clicking and panning"""
+        """Handle point editing and Nuke-style viewer navigation."""
+        alt_held = bool(event.modifiers() & Qt.AltModifier)
+
+        # Nuke-style navigation. These combinations are handled before point
+        # editing so modified clicks can never create an object point.
         if event.button() == Qt.MiddleButton:
-            self._is_panning = True
-            self._pan_start = event.position().toPoint()
-            self.setCursor(Qt.ClosedHandCursor)
-            super().mousePressEvent(event)
+            if alt_held:
+                self._start_zoom_drag(event)
+            else:
+                self._start_pan(event)
             return
-    
+
+        if alt_held and event.button() == Qt.LeftButton:
+            self._start_pan(event)
+            return
+
+        if alt_held and event.button() == Qt.RightButton:
+            # Deliberately unassigned. Plain right-click remains a negative
+            # point and Ctrl+right-click deletes an existing point.
+            event.accept()
+            return
+
         if self.point_editing_enabled:
+            if (
+                event.button() in (Qt.LeftButton, Qt.RightButton)
+                and event.modifiers() & Qt.ControlModifier
+            ):
+                mouse_pos = self.mapToScene(event.position().toPoint())
+                x, y = int(mouse_pos.x()), int(mouse_pos.y())
+                if (
+                    self.original_pixmap
+                    and 0 <= x < self.original_pixmap.width()
+                    and 0 <= y < self.original_pixmap.height()
+                ):
+                    self.point_delete_requested.emit(x, y)
+                    event.accept()
+                    return
+
             if event.button() == Qt.LeftButton:
                 # Update preview point type in case shift is held
                 self._preview_is_positive = True
@@ -782,11 +856,7 @@ class ImageViewer(QGraphicsView):
                     0 <= x < self.original_pixmap.width() and 
                     0 <= y < self.original_pixmap.height()):
                     
-                    # Ctrl+left click = negative point, plain left click = positive
-                    ctrl_held = event.modifiers() & Qt.ControlModifier
-                    is_positive = not bool(ctrl_held)
-                    self._preview_is_positive = is_positive
-                    self.point_clicked.emit(x, y, is_positive)
+                    self.point_clicked.emit(x, y, True)
                     return  # Don't call super() to prevent other handling
             
             elif event.button() == Qt.RightButton:
@@ -810,16 +880,29 @@ class ImageViewer(QGraphicsView):
     
     def mouseMoveEvent(self, event: QMouseEvent):
         """Handle mouse movement for panning, coordinate display, and live preview"""
+        if self._is_zooming:
+            # Nuke zooms horizontally: drag right to zoom in, left to zoom out.
+            delta_x = event.position().x() - self._zoom_drag_start.x()
+            zoom_factor = math.pow(2.0, delta_x / 200.0)
+            self.set_zoom(
+                self._zoom_drag_start_scale * zoom_factor,
+                self._zoom_anchor_view,
+            )
+            event.accept()
+            return
+
         if self._is_panning:
-            delta = event.position().toPoint() - self._pan_start
-            self._pan_start = event.position().toPoint()
+            delta = event.position() - self._pan_start
+            self._pan_start = event.position()
             
             self.horizontalScrollBar().setValue(
-                self.horizontalScrollBar().value() - delta.x()
+                self.horizontalScrollBar().value() - int(delta.x())
             )
             self.verticalScrollBar().setValue(
-                self.verticalScrollBar().value() - delta.y()
+                self.verticalScrollBar().value() - int(delta.y())
             )
+            event.accept()
+            return
         else:
             self._update_mouse_status(event.position().toPoint())
 
@@ -847,10 +930,20 @@ class ImageViewer(QGraphicsView):
     
     def mouseReleaseEvent(self, event: QMouseEvent):
         """Handle mouse release events"""
-        if event.button() == Qt.MiddleButton:
+        if self._is_panning and event.button() == self._navigation_button:
             self._is_panning = False
+            self._navigation_button = Qt.NoButton
             self.setCursor(Qt.ArrowCursor)
-        
+            event.accept()
+            return
+
+        if self._is_zooming and event.button() == self._navigation_button:
+            self._is_zooming = False
+            self._navigation_button = Qt.NoButton
+            self.setCursor(Qt.ArrowCursor)
+            event.accept()
+            return
+
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):

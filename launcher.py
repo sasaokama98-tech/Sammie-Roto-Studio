@@ -6,11 +6,20 @@ import argparse
 import os
 import traceback
 from sammie.resources import resources
+from sammie.branding import (
+    APP_DESCRIPTION,
+    APP_NAME,
+    APP_USER_MODEL_ID,
+    SPLASH_IMAGE_PATH,
+)
 
 def show_splash(app):
-    splash_pix = QPixmap(":/splash.webp")
+    splash_pix = QPixmap(str(SPLASH_IMAGE_PATH))
+    if splash_pix.isNull():
+        # Release archives made before the Studio rebrand only contain the
+        # original splash in the compiled Qt resource bundle.
+        splash_pix = QPixmap(":/splash.webp")
     splash = QSplashScreen(splash_pix, Qt.SplashScreen)
-    splash.showMessage("Loading Sammie-Roto...", Qt.AlignCenter | Qt.AlignBottom, Qt.white)
     splash.setWindowFlags(Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
     splash.show()
     app.processEvents()
@@ -35,9 +44,9 @@ def show_error_dialog(app, error_message, detailed_error=""):
     """Show an error dialog with the crash information"""
     msg_box = QMessageBox()
     msg_box.setIcon(QMessageBox.Critical)
-    msg_box.setWindowTitle("Sammie-Roto Startup Error")
+    msg_box.setWindowTitle(f"{APP_NAME} Startup Error")
     msg_box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-    msg_box.setText("Sammie-Roto encountered an error during startup and cannot continue.")
+    msg_box.setText(f"{APP_NAME} encountered an error during startup and cannot continue.")
     msg_box.setInformativeText(error_message)
     
     if detailed_error:
@@ -59,10 +68,10 @@ def show_error_dialog(app, error_message, detailed_error=""):
         perm_msg_box.setIcon(QMessageBox.Critical)
         perm_msg_box.setWindowTitle("Permission Error")
         perm_msg_box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        perm_msg_box.setText("Sammie-Roto does not have write permission in its installation directory.")
+        perm_msg_box.setText(f"{APP_NAME} does not have write permission in its installation directory.")
         perm_msg_box.setInformativeText(
             f"Current location:\n{app_dir}\n\n"
-            f"Please move Sammie-Roto to a location where you have write access.\n\n"
+            f"Please move {APP_NAME} to a location where you have write access.\n\n"
             f"Avoid running from Program Files or system directories."
         )
         perm_msg_box.setWindowFlags(perm_msg_box.windowFlags() | Qt.WindowStaysOnTopHint)
@@ -75,7 +84,7 @@ def show_error_dialog(app, error_message, detailed_error=""):
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
-        description="Sammie-Roto: Video Segmentation and Matting Tool",
+        description=f"{APP_NAME}: {APP_DESCRIPTION}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
     Examples:
@@ -120,12 +129,13 @@ if __name__ == "__main__":
     try:
         if os.name == 'nt':
             import ctypes
-            myappid = 'Sammie-Roto.2'
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
     except:
         pass
 
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
     app.setWindowIcon(QIcon(":/icon.ico"))
     
     # Check for single instance
@@ -134,7 +144,7 @@ if __name__ == "__main__":
         msg_box = QMessageBox()
         msg_box.setIcon(QMessageBox.Warning)
         msg_box.setWindowTitle("Already Running")
-        msg_box.setText("Sammie-Roto is already running.\nOnly one instance can run at a time.")
+        msg_box.setText(f"{APP_NAME} is already running.\nOnly one instance can run at a time.")
         msg_box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         msg_box.exec()
         sys.exit(0)
@@ -147,9 +157,16 @@ if __name__ == "__main__":
         try:
             from sammie_main import MainWindow
             window = MainWindow(initial_file=file_to_load)
+            # Keep a Python reference for the lifetime of QApplication.
+            # Without this, PySide can destroy the top-level window when this
+            # callback returns while the event loop continues holding the
+            # single-instance lock with no visible GUI.
+            app.main_window = window
             window.show()
             splash.finish(window)
             window.setWindowIcon(QIcon(":/icon.ico"))
+            window.raise_()
+            window.activateWindow()
         except ImportError as e:
             splash.close()
             error_msg = f"Failed to import required modules: {str(e)}"

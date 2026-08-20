@@ -7,6 +7,7 @@ pipeline remain backend-agnostic.
 
 from __future__ import annotations
 
+import inspect
 import os
 import shutil
 from pathlib import Path
@@ -23,12 +24,42 @@ class Sam31UnavailableError(RuntimeError):
 class Sam31Backend:
     MODEL_NAME = "SAM 3.1"
 
-    def __init__(self, device, frame_extension: str):
+    def __init__(
+        self,
+        device,
+        frame_extension: str,
+        checkpoint_path: str | Path | None = None,
+    ):
         self.device = device
         self.frame_extension = frame_extension.lower()
+        self.checkpoint_path = checkpoint_path
         self.predictor = None
         self.session_id: str | None = None
         self.resource_path: str | None = None
+        self.sdpa_backend_mode: str | None = None
+
+    def _resolve_checkpoint_path(self) -> Path | None:
+        """Resolve an explicit, environment, or project-local checkpoint."""
+
+        configured = self.checkpoint_path or os.environ.get("SAM31_CHECKPOINT_PATH")
+        if configured:
+            path = Path(configured).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            path = path.resolve()
+            if not path.is_file():
+                raise Sam31UnavailableError(
+                    f"Configured SAM 3.1 checkpoint was not found: {path}"
+                )
+            return path
+
+        project_checkpoint = (
+            Path(__file__).resolve().parent.parent
+            / "checkpoints"
+            / "sam31"
+            / "sam3.1_multiplex.pt"
+        )
+        return project_checkpoint if project_checkpoint.is_file() else None
 
     def load(self):
         if getattr(self.device, "type", str(self.device)) != "cuda":
@@ -36,17 +67,6 @@ class Sam31Backend:
                 "SAM 3.1 Object Multiplex currently requires a CUDA device. "
                 "Select SAM2/EfficientTAM on CPU, MPS, or XPU."
             )
-        if os.name == "nt":
-            import torch
-
-            capability = torch.cuda.get_device_capability()
-            if capability[0] >= 12:
-                print(
-                    "Warning: SAM 3.1 multiplex propagation has an unresolved "
-                    "upstream kernel issue on Windows with RTX 50-series GPUs. "
-                    "Linux or WSL2 is recommended for production use."
-                )
-
         try:
             from sam3.model_builder import build_sam3_multiplex_video_predictor
         except ImportError as exc:
@@ -55,17 +75,87 @@ class Sam31Backend:
                 "`uv sync --extra sam31` from the project directory."
             ) from exc
 
+        self._configure_sdpa_fallback()
+
+        checkpoint_path = self._resolve_checkpoint_path()
         try:
-            # The official builder downloads the gated SAM 3.1 checkpoint from
-            # Hugging Face when no explicit checkpoint is supplied.
-            self.predictor = build_sam3_multiplex_video_predictor(use_fa3=False)
+            # The released multiplex checkpoint stores complex-valued RoPE
+            # buffers (``freqs_cis``). Real-valued RoPE is intended for the
+            # compiled path and otherwise reports those checkpoint keys as
+            # missing/unexpected.
+            builder_args = {"use_fa3": False, "use_rope_real": False}
+            if checkpoint_path is not None:
+                builder_args["checkpoint_path"] = str(checkpoint_path)
+                print(f"Loading local SAM 3.1 checkpoint: {checkpoint_path}")
+            self.predictor = build_sam3_multiplex_video_predictor(**builder_args)
         except Exception as exc:
-            raise Sam31UnavailableError(
-                "Unable to load the SAM 3.1 checkpoint. Request access to "
-                "facebook/sam3 on Hugging Face and run `hf auth login`, then "
-                "try again."
-            ) from exc
+            if checkpoint_path is not None:
+                message = (
+                    f"Unable to load local SAM 3.1 checkpoint {checkpoint_path}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                message = (
+                    "Unable to download the SAM 3.1 checkpoint. Request access "
+                    "to facebook/sam3.1 on Hugging Face and run `hf auth login`, "
+                    f"then try again. Root cause: {type(exc).__name__}: {exc}"
+                )
+            raise Sam31UnavailableError(message) from exc
         return self.predictor
+
+    def _configure_sdpa_fallback(self):
+        """Avoid SAM3's flash-only SDPA context when Flash is unavailable."""
+        import torch
+
+        flash_available = getattr(
+            torch.backends.cuda, "is_flash_attention_available", lambda: False
+        )()
+        if flash_available:
+            self.sdpa_backend_mode = "flash"
+            return
+
+        import sam3.model.decoder as decoder
+        from torch.nn.attention import SDPBackend
+
+        if getattr(decoder, "_sammie_sdpa_fallback_enabled", False):
+            self.sdpa_backend_mode = getattr(
+                decoder, "_sammie_sdpa_backend_mode", "fallback"
+            )
+            return
+
+        original_sdpa_kernel = decoder.sdpa_kernel
+        fallback_backends = [
+            backend
+            for backend in (
+                getattr(SDPBackend, "CUDNN_ATTENTION", None),
+                getattr(SDPBackend, "EFFICIENT_ATTENTION", None),
+                getattr(SDPBackend, "MATH", None),
+            )
+            if backend is not None
+        ]
+        if not fallback_backends:
+            raise Sam31UnavailableError(
+                "No compatible PyTorch SDPA backend is available for SAM 3.1."
+            )
+
+        def compatible_sdpa_kernel(_requested_backend, *args, **kwargs):
+            try:
+                return original_sdpa_kernel(fallback_backends, set_priority=True)
+            except TypeError:
+                # Compatibility with PyTorch versions before set_priority.
+                return original_sdpa_kernel(fallback_backends)
+
+        backend_names = "/".join(
+            str(backend).rsplit(".", 1)[-1] for backend in fallback_backends
+        )
+        decoder.sdpa_kernel = compatible_sdpa_kernel
+        decoder._sammie_sdpa_fallback_enabled = True
+        decoder._sammie_sdpa_backend_mode = backend_names
+        self.sdpa_backend_mode = backend_names
+        print(
+            "SAM 3.1 Flash SDPA is unavailable; using "
+            f"{backend_names} fallback."
+        )
 
     def _prepare_resource(self, frames_dir: str) -> str:
         """Return a JPEG frame directory accepted by the official predictor."""
@@ -96,14 +186,53 @@ class Sam31Backend:
             raise RuntimeError("SAM 3.1 model is not loaded")
         self.close_session()
         self.resource_path = self._prepare_resource(frames_dir)
-        response = self.predictor.handle_request(
-            {
-                "type": "start_session",
-                "resource_path": self.resource_path,
-                "offload_video_to_cpu": True,
-            }
-        )
+        request = {
+            "type": "start_session",
+            "resource_path": self.resource_path,
+            "offload_video_to_cpu": True,
+        }
+        response = self._handle_start_session(request)
         self.session_id = response["session_id"]
+
+    def _handle_start_session(self, request):
+        """Bridge SAM3 predictor/model init_state signature differences."""
+        model = getattr(self.predictor, "model", None)
+        init_state = getattr(model, "init_state", None)
+        if init_state is None:
+            return self.predictor.handle_request(request)
+
+        try:
+            parameters = inspect.signature(init_state).parameters
+        except (TypeError, ValueError):
+            return self.predictor.handle_request(request)
+
+        accepts_extra_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        if accepts_extra_kwargs or "offload_state_to_cpu" in parameters:
+            return self.predictor.handle_request(request)
+
+        supported_names = set(parameters)
+        original_init_state = init_state
+
+        def compatible_init_state(*args, **kwargs):
+            supported_kwargs = {
+                name: value
+                for name, value in kwargs.items()
+                if name in supported_names
+            }
+            return original_init_state(*args, **supported_kwargs)
+
+        # Sam3BasePredictor currently always supplies offload_state_to_cpu,
+        # while the released SAM 3.1 multiplex init_state does not accept it.
+        # Patch only for the duration of session creation and restore it even
+        # if initialization fails.
+        model.init_state = compatible_init_state
+        try:
+            return self.predictor.handle_request(request)
+        finally:
+            model.init_state = original_init_state
 
     @staticmethod
     def masks_from_outputs(outputs: dict) -> list[tuple[int, np.ndarray]]:

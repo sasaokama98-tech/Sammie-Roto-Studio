@@ -28,6 +28,7 @@ from sammie.export_image_dialog import ImageExportDialog
 from sammie.export_dialog import ExportDialog
 from sammie.settings_dialog import SettingsDialog
 from sammie.settings_manager import get_settings_manager, initialize_settings, ApplicationSettings
+from sammie.branding import APP_DESCRIPTION, APP_NAME
 
 # Import GUI widgets
 from sammie.gui_widgets import (
@@ -141,7 +142,11 @@ class SegmentationTab(QWidget):
         self._update_name_display(0)
         
         # Instructions for mouse clicks
-        instructions_label = QLabel("Left-click: Add positive point\nCtrl+Left-click: Add negative point\nRight-click: Add negative point\nHold Shift: Live Preview")
+        instructions_label = QLabel(
+            "Left-click: Positive | Right-click: Negative | Ctrl+click: Delete\n"
+            "MMB / Alt+Left drag: Move | Alt+MMB drag: Zoom\n"
+            "Mouse wheel: Zoom | Hold Shift: Live Preview"
+        )
         instructions_label.setStyleSheet("""
             QLabel {
                 background-color: palette(alternate-base);
@@ -171,7 +176,8 @@ class SegmentationTab(QWidget):
         self.sam_model_combo.setToolTip(
             "Large model is slower but slightly more accurate.\n"
             "Efficient model is faster but less accurate.\n"
-            "SAM 3.1 requires CUDA and authenticated Hugging Face checkpoint access."
+            "SAM 3.1 requires CUDA and uses checkpoints/sam31/"
+            "sam3.1_multiplex.pt when available, otherwise Hugging Face."
         )
         self.sam_model_btn = QPushButton("Load Model")
         self.sam_model_btn.setEnabled(False) # disabled until video is loaded
@@ -1258,7 +1264,7 @@ class MainWindow(QMainWindow):
     def __init__(self, initial_file=None):
         super().__init__()
         self.settings_mgr = initialize_settings()
-        self.setWindowTitle(f"Sammie-Roto {__version__}")
+        self.setWindowTitle(f"{APP_NAME} {__version__}")
         self.setWindowIcon(QIcon(":/icon.ico"))
         self.is_playing = False
         self.play_timer = QTimer(self)
@@ -1289,7 +1295,7 @@ class MainWindow(QMainWindow):
         self._connect_signals()
         self._setup_hotkeys()
         self._update_point_editing_state()
-        print(f"Sammie-Roto version {__version__}")
+        print(f"{APP_NAME} version {__version__}")
         self.update_checker.check_for_updates()
 
         # Show the window immediately so it appears before model loading
@@ -1313,7 +1319,7 @@ class MainWindow(QMainWindow):
                 self.resume_prev_session()
         else:
             self.resume_prev_session()
-    
+
     # ==================== INITIALIZATION ====================
     
     def _init_ui(self):
@@ -1368,6 +1374,7 @@ class MainWindow(QMainWindow):
         """Connect all UI signals"""
         # Connect image viewer point clicks and preview
         self.viewer.point_clicked.connect(self.add_point_from_click)
+        self.viewer.point_delete_requested.connect(self.delete_point_from_click)
         self.viewer.preview_requested.connect(self.on_preview_requested)
         self.viewer.preview_cancelled.connect(self.on_preview_cancelled)
 
@@ -1498,7 +1505,7 @@ class MainWindow(QMainWindow):
             ("Help", self.show_help),
             ("Shortcut Keys", self.show_hotkeys_help),
             (None, None),  # Separator
-            ("Open Sammie-Roto Folder", self.open_folder),
+            (f"Open {APP_NAME} Folder", self.open_folder),
             (None, None),  # Separator
             ("Changelog", self.show_changelog),
             ("About", self.show_about)
@@ -2166,6 +2173,55 @@ class MainWindow(QMainWindow):
             self.viewer._preview_pending_pos = (x, y)
             self.viewer._preview_timer.start()
 
+    def delete_point_from_click(self, x, y):
+        """Delete the visible point nearest a Ctrl+click."""
+        current_frame = self.frame_slider.value()
+        selected_object_id = (
+            self.sidebar.segmentation_tab.get_selected_object_id()
+        )
+        hit_radius = 12.0 / max(self.viewer.current_scale, 0.001)
+        removed_point = self.point_manager.remove_nearest_point(
+            current_frame,
+            x,
+            y,
+            max_distance=hit_radius,
+            preferred_object_id=selected_object_id,
+        )
+        if removed_point is None:
+            print(f"No point near ({x}, {y}) on frame {current_frame}")
+            return
+
+        frame = removed_point['frame']
+        object_id = removed_point['object_id']
+        point_type = "positive" if removed_point['positive'] else "negative"
+        for output_dir in (core.mask_dir, core.trimap_dir):
+            output_path = os.path.join(
+                output_dir, f"{frame:05d}", f"{object_id}.png"
+            )
+            if os.path.isfile(output_path):
+                os.remove(output_path)
+
+        remaining_points = self.point_manager.get_all_points()
+        if remaining_points:
+            self.sam_manager.replay_points(remaining_points)
+        else:
+            self.sam_manager.reset_state()
+            self._update_current_frame_display()
+
+        self.highlighted_point = None
+        self.sam_manager.propagated = False
+        self.sam_manager.deduplicated = False
+        self.matany_manager.propagated = False
+        self.removal_manager.propagated = False
+        self._refresh_table()
+        self.update_tracking_status()
+        self.update_matting_status()
+        self.update_removal_status()
+        print(
+            f"Deleted {point_type} point: Frame {frame}, Object {object_id}, "
+            f"Position ({removed_point['x']}, {removed_point['y']})"
+        )
+
     def _add_point_and_segment(self, frame, object_id, is_positive, x, y, point_type):
         """Helper method to add point and trigger segmentation"""
         # Add the point (this will trigger point callback but not update image yet)
@@ -2785,6 +2841,11 @@ class MainWindow(QMainWindow):
         self._create_shortcut("Ctrl+Shift+E", self.export_image, "Export Image", create_shortcut=False)
         
         # View/Zoom controls
+        self._create_shortcut("MMB drag", None, "Pan Viewer", create_shortcut=False)
+        self._create_shortcut("Alt+LMB drag", None, "Pan Viewer", create_shortcut=False)
+        self._create_shortcut("Alt+MMB drag", None, "Zoom Viewer", create_shortcut=False)
+        self._create_shortcut("Mouse wheel", None, "Zoom Viewer at pointer", create_shortcut=False)
+        self._create_shortcut("Ctrl+LMB/RMB", None, "Delete point under cursor", create_shortcut=False)
         self._create_shortcut("Backspace", self.zoom_100, "100% Zoom", create_shortcut=False)
         self._create_shortcut("Ctrl+Backspace", self.fit_to_screen, "Fit to Screen", create_shortcut=False)
         self._create_shortcut("=", self.zoom_in, "Zoom In")
@@ -3155,7 +3216,7 @@ class MainWindow(QMainWindow):
     def on_update_available(self, current_version, latest_version):
         """Handle update available signal from background thread"""
         # Print to console
-        print(f"🔔 A new version of Sammie-roto is available! ({latest_version}) It can be installed from the File menu.")
+        print(f"🔔 A new version of {APP_NAME} is available! ({latest_version}) It can be installed from the File menu.")
         
         # Add menu item to file menu if it doesn't already exist
         if self.update_menu_action is None:
@@ -3266,12 +3327,13 @@ class MainWindow(QMainWindow):
     def show_about(self):
         """Show about dialog"""
         msg = QMessageBox(self)
-        msg.setWindowTitle("About Sammie-Roto")
-        msg.setText(f"Sammie-Roto Version {__version__}")
+        msg.setWindowTitle(f"About {APP_NAME}")
+        msg.setText(f"{APP_NAME} Version {__version__}")
         
         # Use rich text to make the URL clickable
         info_text = (
-            "Video Segmentation and Matting tool<br><br>"
+            f"{APP_DESCRIPTION}<br><br>"
+            "Based on Sammie-Roto 2<br>"
             '<a href="https://github.com/Zarxrax/Sammie-Roto-2">https://github.com/Zarxrax/Sammie-Roto-2</a>'
         )
         msg.setInformativeText(info_text)
@@ -3289,7 +3351,7 @@ def main():
     """Main application entry point"""
     # Parse command line arguments when called directly
     parser = argparse.ArgumentParser(
-        description="Sammie-Roto: Video Segmentation and Matting Tool",
+        description=f"{APP_NAME}: {APP_DESCRIPTION}",
         add_help=False  # We'll add help manually to avoid conflicts
     )
     parser.add_argument('file', nargs='?', help='Path to video or image file to load')
@@ -3319,6 +3381,8 @@ Examples:
             return
 
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(APP_NAME)
     app.setWindowIcon(QIcon(":/icon.ico"))
 
     window = MainWindow(initial_file=file_to_load)

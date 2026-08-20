@@ -1,4 +1,8 @@
+import os
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -36,6 +40,38 @@ class _FakePredictor:
         }
 
 
+class _MultiplexModelWithoutStateOffload:
+    def __init__(self):
+        self.init_kwargs = None
+
+    def init_state(
+        self,
+        resource_path,
+        offload_video_to_cpu=False,
+        async_loading_frames=False,
+    ):
+        self.init_kwargs = {
+            "resource_path": resource_path,
+            "offload_video_to_cpu": offload_video_to_cpu,
+            "async_loading_frames": async_loading_frames,
+        }
+        return {"frames": []}
+
+
+class _PredictorWithIncompatibleBaseSession:
+    def __init__(self):
+        self.model = _MultiplexModelWithoutStateOffload()
+
+    def handle_request(self, request):
+        self.model.init_state(
+            resource_path=request["resource_path"],
+            offload_video_to_cpu=request.get("offload_video_to_cpu", False),
+            offload_state_to_cpu=False,
+            async_loading_frames=True,
+        )
+        return {"session_id": "compatible-session"}
+
+
 class Sam31BackendTests(unittest.TestCase):
     def setUp(self):
         self.backend = Sam31Backend(_Device(), "png")
@@ -53,6 +89,27 @@ class Sam31BackendTests(unittest.TestCase):
         self.assertEqual(masks[0][0], 4)
         self.assertEqual(masks[0][1].shape, (4, 5))
 
+    def test_explicit_checkpoint_path_is_resolved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "sam3.1_multiplex.pt"
+            checkpoint.touch()
+            backend = Sam31Backend(_Device(), "png", checkpoint)
+            self.assertEqual(backend._resolve_checkpoint_path(), checkpoint.resolve())
+
+    def test_environment_checkpoint_path_is_supported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "sam3.1_multiplex.pt"
+            checkpoint.touch()
+            with patch.dict(os.environ, {"SAM31_CHECKPOINT_PATH": str(checkpoint)}):
+                backend = Sam31Backend(_Device(), "png")
+                self.assertEqual(
+                    backend._resolve_checkpoint_path(), checkpoint.resolve()
+                )
+
+    def test_missing_configured_checkpoint_has_actionable_error(self):
+        backend = Sam31Backend(_Device(), "png", "missing-sam31.pt")
+        with self.assertRaisesRegex(Exception, "checkpoint was not found"):
+            backend._resolve_checkpoint_path()
 
     def test_add_points_uses_absolute_coordinates(self):
         masks = self.backend.add_points(
@@ -86,6 +143,23 @@ class Sam31BackendTests(unittest.TestCase):
         self.assertEqual(self.backend.predictor.requests[-2]["type"], "reset_session")
         self.assertEqual(self.backend.predictor.requests[-1]["type"], "remove_object")
         self.assertEqual(self.backend.predictor.requests[-1]["obj_id"], 9)
+
+    def test_session_filters_unsupported_state_offload_argument(self):
+        predictor = _PredictorWithIncompatibleBaseSession()
+        self.backend.predictor = predictor
+
+        response = self.backend._handle_start_session(
+            {
+                "type": "start_session",
+                "resource_path": "frames",
+                "offload_video_to_cpu": True,
+            }
+        )
+
+        self.assertEqual(response["session_id"], "compatible-session")
+        self.assertEqual(predictor.model.init_kwargs["resource_path"], "frames")
+        self.assertTrue(predictor.model.init_kwargs["offload_video_to_cpu"])
+        self.assertTrue(predictor.model.init_kwargs["async_loading_frames"])
 
 
 if __name__ == "__main__":

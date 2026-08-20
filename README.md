@@ -1,7 +1,9 @@
-# Sammie-Roto 2
+# Sammie Roto Studio
 **S**egment **A**nything **M**odel with **M**atting **I**ntegrated **E**legantly
 
-![Sammie-Roto 2 screenshot](https://github.com/user-attachments/assets/bc2c99c8-4039-49f1-94ed-65f104a83e8d)
+Sammie Roto Studio is the VFX-focused extension of [Sammie-Roto 2](https://github.com/Zarxrax/Sammie-Roto-2), adding SAM 3.1 tracking and high-quality trimap/matting workflows while retaining the original application's interaction and export pipeline.
+
+![Sammie Roto Studio screenshot](https://github.com/user-attachments/assets/bc2c99c8-4039-49f1-94ed-65f104a83e8d)
 
 [![GitHub Downloads](https://img.shields.io/github/downloads/Zarxrax/Sammie-Roto-2/total)](https://github.com/Zarxrax/Sammie-Roto-2/releases)
 [![GitHub Code License](https://img.shields.io/github/license/Zarxrax/Sammie-Roto-2)](LICENSE)
