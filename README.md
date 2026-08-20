@@ -9,6 +9,12 @@ Sammie Roto Studio is the VFX-focused extension of [Sammie-Roto 2](https://githu
 [![GitHub Code License](https://img.shields.io/github/license/Zarxrax/Sammie-Roto-2)](LICENSE)
 [![Discord](https://img.shields.io/discord/1437589475369811970?label=Discord&color=blue)](https://discord.gg/jb5qrFyGFF)
 
+## Upstream and acknowledgements
+
+Sammie Roto Studio is an independently maintained downstream extension of [Sammie-Roto 2](https://github.com/Zarxrax/Sammie-Roto-2), created by [Zarxrax](https://github.com/Zarxrax). We sincerely thank Zarxrax and every upstream contributor for the original application, its approachable workflow, and the substantial foundation on which this project is built.
+
+The upstream copyright and the [GNU General Public License v3.0](LICENSE) remain in effect. Studio-specific changes and support requests should be reported to this repository so that the official upstream project is not burdened with issues that only affect this extension.
+
 **Please add a Github Star if you find it useful!**
 
 Sammie-Roto 2 is an easy-to-use, cross-platform desktop application for AI assisted masking of video clips. It has 3 primary functions:
