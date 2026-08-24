@@ -7,6 +7,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 from sammie.settings_manager import SettingsManager
+from sammie.hybrid_hq import BALANCED, MAXIMUM_DETAIL, PRESERVE_TEMPORAL
+from sammie.memory_profiles import PROFILE_NAMES
 from sammie.gui_widgets import (
     ColorPickerWidget
 )
@@ -124,9 +126,39 @@ class SettingsDialog(QDialog):
 
         # Matting model selection
         self.default_matting_model_combo = QComboBox()
-        self.default_matting_model_combo.addItems(["MatAnyone", "MatAnyone2", "VideoMaMa", "ViTMatte"])
-        self.default_matting_model_combo.setToolTip("VideoMaMa is higher quality but slower and uses more VRAM.")
+        self.default_matting_model_combo.addItems(
+            [
+                "MatAnyone",
+                "MatAnyone2",
+                "VideoMaMa",
+                "ViTMatte",
+                "MEMatte",
+                "Hybrid HQ",
+            ]
+        )
+        self.default_matting_model_combo.setToolTip(
+            "VideoMaMa provides temporal matting; ViTMatte and MEMatte refine "
+            "original-resolution image edges. Hybrid HQ combines both stages."
+        )
         mat_layout.addRow("Matting Model:", self.default_matting_model_combo)
+
+        self.default_memory_profile_combo = QComboBox()
+        self.default_memory_profile_combo.addItems(PROFILE_NAMES)
+        self.default_memory_profile_combo.setToolTip(
+            "Initial memory/performance policy for new sessions. Custom keeps "
+            "the individual defaults below. Hybrid HQ always unloads large "
+            "models between stages."
+        )
+        mat_layout.addRow("Memory Profile:", self.default_memory_profile_combo)
+
+        self.default_performance_metrics_checkbox = QCheckBox()
+        self.default_performance_metrics_checkbox.setToolTip(
+            "Record Hybrid HQ stage time and CUDA peak memory for new sessions."
+        )
+        mat_layout.addRow(
+            "Record Performance Metrics:",
+            self.default_performance_metrics_checkbox,
+        )
 
         # Matting Internal Resolution selection
         self.default_matany_res_combo = QComboBox()
@@ -146,6 +178,40 @@ class SettingsDialog(QDialog):
         self.default_matany_chunk_combo.addItems(["16", "32", "64", "128", "256", "512"])
         self.default_matany_chunk_combo.setToolTip("Number of frames per batch (VideoMaMa only).")
         mat_layout.addRow("Frames per batch:", self.default_matany_chunk_combo)
+
+        self.default_hybrid_stability_combo = QComboBox()
+        self.default_hybrid_stability_combo.addItems(
+            [PRESERVE_TEMPORAL, BALANCED, MAXIMUM_DETAIL]
+        )
+        self.default_hybrid_stability_combo.setToolTip(
+            "Default temporal-protection level for new Hybrid HQ sessions."
+        )
+        mat_layout.addRow(
+            "Hybrid Stability:", self.default_hybrid_stability_combo
+        )
+
+        self.default_hybrid_motion_checkbox = QCheckBox()
+        self.default_hybrid_motion_checkbox.setToolTip(
+            "Enable experimental bidirectional optical-flow confidence for new sessions."
+        )
+        mat_layout.addRow(
+            "Hybrid Motion Confidence:", self.default_hybrid_motion_checkbox
+        )
+
+        self.default_hybrid_flow_resolution_combo = QComboBox()
+        self.default_hybrid_flow_resolution_combo.addItems(["480", "720", "1080"])
+        mat_layout.addRow(
+            "Hybrid Flow Resolution:", self.default_hybrid_flow_resolution_combo
+        )
+
+        self.default_hybrid_evaluation_checkbox = QCheckBox()
+        self.default_hybrid_evaluation_checkbox.setToolTip(
+            "Archive Hybrid HQ temporal/final mattes and calculate Phase 4.3 "
+            "no-reference comparison metrics for new sessions."
+        )
+        mat_layout.addRow(
+            "Save Hybrid Evaluation:", self.default_hybrid_evaluation_checkbox
+        )
 
         # Matting Combined Mask
         self.default_combined_mask_checkbox = QCheckBox()
@@ -298,9 +364,27 @@ class SettingsDialog(QDialog):
         self.default_matany_gamma_spin.setValue(app_settings.default_matany_gamma)
         self.default_matany_grow_spin.setValue(app_settings.default_matany_grow)
         self.default_matting_model_combo.setCurrentText(app_settings.default_matany_model)
+        self.default_memory_profile_combo.setCurrentText(
+            app_settings.default_memory_profile
+        )
+        self.default_performance_metrics_checkbox.setChecked(
+            app_settings.default_performance_metrics_enabled
+        )
         self.default_combined_mask_checkbox.setChecked(app_settings.default_matany_combined)
         self.default_matany_overlap_combo.setCurrentText(str(app_settings.default_matany_overlap))
         self.default_matany_chunk_combo.setCurrentText(str(app_settings.default_matany_chunk))
+        self.default_hybrid_stability_combo.setCurrentText(
+            app_settings.default_hybrid_stability_preset
+        )
+        self.default_hybrid_motion_checkbox.setChecked(
+            app_settings.default_hybrid_motion_enabled
+        )
+        self.default_hybrid_flow_resolution_combo.setCurrentText(
+            str(app_settings.default_hybrid_flow_resolution)
+        )
+        self.default_hybrid_evaluation_checkbox.setChecked(
+            app_settings.default_hybrid_evaluation_enabled
+        )
 
         # Set MatAnyone resolution combo box
         if app_settings.default_matany_res == 0:
@@ -346,9 +430,27 @@ class SettingsDialog(QDialog):
         app_settings.default_matany_gamma = self.default_matany_gamma_spin.value()
         app_settings.default_matany_grow = self.default_matany_grow_spin.value()
         app_settings.default_matany_model = self.default_matting_model_combo.currentText()
+        app_settings.default_memory_profile = (
+            self.default_memory_profile_combo.currentText()
+        )
+        app_settings.default_performance_metrics_enabled = (
+            self.default_performance_metrics_checkbox.isChecked()
+        )
         app_settings.default_matany_combined = self.default_combined_mask_checkbox.isChecked()
         app_settings.default_matany_overlap = int(self.default_matany_overlap_combo.currentText())
         app_settings.default_matany_chunk = int(self.default_matany_chunk_combo.currentText())
+        app_settings.default_hybrid_stability_preset = (
+            self.default_hybrid_stability_combo.currentText()
+        )
+        app_settings.default_hybrid_motion_enabled = (
+            self.default_hybrid_motion_checkbox.isChecked()
+        )
+        app_settings.default_hybrid_flow_resolution = int(
+            self.default_hybrid_flow_resolution_combo.currentText()
+        )
+        app_settings.default_hybrid_evaluation_enabled = (
+            self.default_hybrid_evaluation_checkbox.isChecked()
+        )
 
         # Handle MatAnyone resolution setting
         matany_text = self.default_matany_res_combo.currentText()

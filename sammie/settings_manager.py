@@ -6,6 +6,8 @@ from typing import Dict, Any, Optional
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
+from sammie.memory_profiles import BALANCED, CUSTOM, get_memory_profile
+
 @dataclass
 class ApplicationSettings:
     """Global application settings that persist across sessions"""
@@ -52,6 +54,20 @@ class ApplicationSettings:
     default_vitmatte_roi_margin: int = 64
     default_vitmatte_tile_size: int = 1024
     default_vitmatte_tile_overlap: int = 128
+    default_mematte_roi_margin: int = 96
+    default_mematte_tile_size: int = 2048
+    default_mematte_tile_overlap: int = 128
+    default_mematte_max_tokens: int = 12000
+    default_mematte_precision: str = "Float16"
+    default_hybrid_temporal_model: str = "MatAnyone2"
+    default_hybrid_stability_preset: str = "Preserve Temporal"
+    default_hybrid_motion_enabled: bool = False
+    default_hybrid_flow_resolution: int = 720
+    default_hybrid_evaluation_enabled: bool = False
+    default_hybrid_edge_width: int = 12
+    default_hybrid_edge_feather: int = 4
+    default_memory_profile: str = BALANCED
+    default_performance_metrics_enabled: bool = True
 
     # Object Removal Processing defaults
     default_removal_method: str = "Minimax-Remover"
@@ -98,6 +114,12 @@ class SessionSettings:
     color_space: int = 1    # 1=BT.709, 5=BT.601 etc.
     in_point: int = None
     out_point: int = None
+    media_type: str = ""
+    source_frame_numbers: list = field(default_factory=list)
+    source_frame_padding: int = 0
+    source_frame_numbers_inferred: bool = False
+    source_timecodes: list = field(default_factory=list)
+    frame_display_mode: str = "Frame Index"
     
     # Current state
     current_frame: int = 0
@@ -132,6 +154,21 @@ class SessionSettings:
     vitmatte_roi_margin: int = 64
     vitmatte_tile_size: int = 1024
     vitmatte_tile_overlap: int = 128
+    mematte_roi_margin: int = 96
+    mematte_tile_size: int = 2048
+    mematte_tile_overlap: int = 128
+    mematte_max_tokens: int = 12000
+    mematte_precision: str = "Float16"
+    hybrid_temporal_model: str = "MatAnyone2"
+    hybrid_stability_preset: str = "Preserve Temporal"
+    hybrid_motion_enabled: bool = False
+    hybrid_flow_resolution: int = 720
+    hybrid_evaluation_enabled: bool = False
+    hybrid_evaluation_label: str = ""
+    hybrid_edge_width: int = 12
+    hybrid_edge_feather: int = 4
+    memory_profile: str = CUSTOM
+    performance_metrics_enabled: bool = True
 
     # Object removal parameters
     inpaint_method: str = "Telea"
@@ -297,6 +334,27 @@ class SettingsManager:
             matany_overlap=self.app_settings.default_matany_overlap,
             matany_chunk=self.app_settings.default_matany_chunk,
             matany_combined=self.app_settings.default_matany_combined,
+            trimap_auto=self.app_settings.default_trimap_auto,
+            trimap_fg_erode=self.app_settings.default_trimap_fg_erode,
+            trimap_bg_dilate=self.app_settings.default_trimap_bg_dilate,
+            vitmatte_roi_margin=self.app_settings.default_vitmatte_roi_margin,
+            vitmatte_tile_size=self.app_settings.default_vitmatte_tile_size,
+            vitmatte_tile_overlap=self.app_settings.default_vitmatte_tile_overlap,
+            mematte_roi_margin=self.app_settings.default_mematte_roi_margin,
+            mematte_tile_size=self.app_settings.default_mematte_tile_size,
+            mematte_tile_overlap=self.app_settings.default_mematte_tile_overlap,
+            mematte_max_tokens=self.app_settings.default_mematte_max_tokens,
+            mematte_precision=self.app_settings.default_mematte_precision,
+            hybrid_temporal_model=self.app_settings.default_hybrid_temporal_model,
+            hybrid_stability_preset=self.app_settings.default_hybrid_stability_preset,
+            hybrid_motion_enabled=self.app_settings.default_hybrid_motion_enabled,
+            hybrid_flow_resolution=self.app_settings.default_hybrid_flow_resolution,
+            hybrid_evaluation_enabled=self.app_settings.default_hybrid_evaluation_enabled,
+            hybrid_evaluation_label="",
+            hybrid_edge_width=self.app_settings.default_hybrid_edge_width,
+            hybrid_edge_feather=self.app_settings.default_hybrid_edge_feather,
+            memory_profile=self.app_settings.default_memory_profile,
+            performance_metrics_enabled=self.app_settings.default_performance_metrics_enabled,
             inpaint_method=self.app_settings.default_inpaint_method,
             inpaint_radius=self.app_settings.default_inpaint_radius,
             inpaint_grow=self.app_settings.default_inpaint_grow,
@@ -307,6 +365,10 @@ class SettingsManager:
             created_timestamp=timestamp,
             modified_timestamp=timestamp
         )
+        profile = get_memory_profile(self.session_settings.memory_profile)
+        if profile is not None:
+            for key, value in profile.settings.items():
+                setattr(self.session_settings, key, value)
     
     # ==================== POINTS MANAGEMENT ====================
     

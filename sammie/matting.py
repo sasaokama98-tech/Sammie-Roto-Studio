@@ -1,6 +1,7 @@
 # sammie/matting.py
 import cv2
 import os
+import json
 import numpy as np
 import torch
 import gc
@@ -12,6 +13,26 @@ from sammie.settings_manager import get_settings_manager
 from sammie.model_downloader import ensure_models
 from sammie.trimap import TrimapConfig, generate_trimap
 from sammie.vitmatte_backend import VitMatteBackend, VitMatteUnavailableError
+from sammie.mematte_backend import MematteBackend, MematteUnavailableError
+from sammie.hybrid_hq import (
+    PRESERVE_TEMPORAL,
+    alpha_to_float,
+    apply_edge_residual,
+    build_edge_residual,
+    get_hybrid_merge_preset,
+    stabilize_edge_residual,
+    temporal_alpha_to_trimap,
+)
+from sammie.motion_confidence import (
+    calculate_bidirectional_alignment,
+    motion_confidence_gate,
+    warp_source_to_target,
+)
+from sammie.hybrid_evaluation import (
+    HybridEvaluationCancelled,
+    evaluate_hybrid_run,
+)
+from sammie.performance_metrics import MattingRunProfiler, write_performance_report
 
 
 class MattingManager:
@@ -237,6 +258,10 @@ class MatAnyManager(MattingManager):
 
     BACKEND = "matanyone"
 
+    def __init__(self, model_name=None):
+        super().__init__()
+        self.model_name = model_name
+
     def load_matting_model(self, load_to_cpu=False, parent_window=None):
         """Load the MatAnyone model and return processor"""
         from matanyone.inference.inference_core import InferenceCore
@@ -244,7 +269,9 @@ class MatAnyManager(MattingManager):
 
         device = self._prepare_device(load_to_cpu)
         settings_mgr = get_settings_manager()
-        matting_model = settings_mgr.get_session_setting("matany_model", "MatAnyone2")
+        matting_model = self.model_name or settings_mgr.get_session_setting(
+            "matany_model", "MatAnyone2"
+        )
         max_size = settings_mgr.get_session_setting("matany_res", 0)
         combined = settings_mgr.get_session_setting("matany_combined", False)
 
@@ -789,6 +816,785 @@ class VitMatteManager(ImageMattingManager):
 
 
 # ---------------------------------------------------------------------------
+# MEMatte image backend
+# ---------------------------------------------------------------------------
+
+class MematteManager(ImageMattingManager):
+    """High-resolution, token-limited MEMatte image matting manager."""
+
+    BACKEND = "MEMatte"
+
+    def __init__(self):
+        super().__init__()
+        self.backend = None
+
+    def load_matting_model(self, load_to_cpu=False, parent_window=None):
+        settings_mgr = get_settings_manager()
+        device = self._prepare_device(load_to_cpu)
+        self.backend = MematteBackend(
+            device,
+            max_number_token=settings_mgr.get_session_setting(
+                "mematte_max_tokens", 12000
+            ),
+            precision=settings_mgr.get_session_setting(
+                "mematte_precision", "Float16"
+            ),
+        )
+        try:
+            self.backend.load()
+        except MematteUnavailableError as exc:
+            print(str(exc))
+            self.backend = None
+            return None
+        self.processor = self.backend
+        print(
+            f"Loaded MEMatte model to {device} with max tokens "
+            f"{self.backend.max_number_token} ({self.backend.precision})"
+        )
+        return self.processor
+
+    def unload_matting_model(self):
+        if self.backend is not None:
+            self.backend.unload()
+        self.backend = None
+        self.processor = None
+        gc.collect()
+        core.DeviceManager.clear_cache()
+        print("Unloaded MEMatte model")
+
+    def run_matting(self, points_list, parent_window, combined=False):
+        if self.backend is None:
+            print("MEMatte model not loaded")
+            return 0
+
+        settings_mgr = get_settings_manager()
+        start_frame, end_frame, frames_to_process = self._get_frame_range()
+        source_object_ids = sorted({int(point["object_id"]) for point in points_list})
+        if not source_object_ids:
+            return 0
+        jobs = [(0, source_object_ids)] if combined else [
+            (object_id, [object_id]) for object_id in source_object_ids
+        ]
+        total_operations = frames_to_process * len(jobs)
+        progress_dialog, pbar = self._make_progress_dialog(parent_window, total_operations)
+        margin = settings_mgr.get_session_setting("mematte_roi_margin", 96)
+        tile_size = settings_mgr.get_session_setting("mematte_tile_size", 2048)
+        tile_overlap = settings_mgr.get_session_setting("mematte_tile_overlap", 128)
+        self.backend.max_number_token = settings_mgr.get_session_setting(
+            "mematte_max_tokens", 12000
+        )
+        self.backend.precision = settings_mgr.get_session_setting(
+            "mematte_precision", "Float16"
+        )
+        display_frequency = settings_mgr.get_app_setting("display_update_frequency", 5)
+        extension = core.get_frame_extension()
+        completed = 0
+        cancelled = False
+
+        os.makedirs(core.matting_dir, exist_ok=True)
+        if combined:
+            for frame_dirname in os.listdir(core.matting_dir):
+                frame_dir = os.path.join(core.matting_dir, frame_dirname)
+                if os.path.isdir(frame_dir):
+                    for filename in os.listdir(frame_dir):
+                        if filename != "0.png":
+                            os.remove(os.path.join(frame_dir, filename))
+
+        try:
+            for output_id, input_ids in jobs:
+                pbar.set_description(f"MEMatte object {output_id}")
+                for frame_number in range(start_frame, end_frame + 1):
+                    if progress_dialog.wasCanceled():
+                        cancelled = True
+                        break
+                    frame_path = os.path.join(
+                        core.frames_dir, f"{frame_number:05d}.{extension}"
+                    )
+                    bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
+                    if bgr is None:
+                        raise OSError(f"Unable to read frame: {frame_path}")
+                    trimap = self._make_trimap(frame_number, output_id, input_ids)
+                    if trimap is None:
+                        continue
+                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                    alpha = self.backend.predict_multi_roi_float(
+                        rgb,
+                        trimap,
+                        margin=margin,
+                        max_tile_size=tile_size,
+                        tile_overlap=tile_overlap,
+                    )
+                    output_path = os.path.join(
+                        core.matting_dir, f"{frame_number:05d}", f"{output_id}.png"
+                    )
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    alpha16 = np.round(np.clip(alpha, 0.0, 1.0) * 65535.0).astype(
+                        np.uint16
+                    )
+                    if not cv2.imwrite(output_path, alpha16):
+                        raise OSError(f"Failed to write matte: {output_path}")
+
+                    completed += 1
+                    pbar.update(1)
+                    progress_dialog.setValue(
+                        int(completed * 100 / max(total_operations, 1))
+                    )
+                    if frame_number % display_frequency == 0:
+                        parent_window.frame_slider.setValue(frame_number)
+                    QApplication.processEvents()
+                if cancelled:
+                    break
+        finally:
+            pbar.close()
+            progress_dialog.close()
+            core.DeviceManager.clear_cache()
+
+        self.propagated = (
+            not cancelled
+            and start_frame == 0
+            and end_frame == core.VideoInfo.total_frames - 1
+        )
+        if cancelled:
+            print("MEMatte matting cancelled")
+            return 0
+        print("MEMatte matting completed")
+        self._notify('matting_complete')
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Hybrid HQ staged temporal + spatial backend
+# ---------------------------------------------------------------------------
+
+class HybridHQManager(MattingManager):
+    """Temporal matte followed by MEMatte refinement only in uncertain edges."""
+
+    BACKEND = "Hybrid HQ"
+
+    def __init__(self):
+        super().__init__()
+        self.temporal_manager = None
+        self.edge_backend = None
+
+    def load_matting_model(self, load_to_cpu=False, parent_window=None):
+        # Large models are deliberately loaded inside run_matting one stage at a
+        # time. Returning this lightweight coordinator satisfies the existing UI
+        # lifecycle without co-resident temporal and spatial models.
+        self.processor = self
+        return self
+
+    def unload_matting_model(self):
+        if self.temporal_manager is not None:
+            self.temporal_manager.unload_matting_model()
+            self.temporal_manager = None
+        if self.edge_backend is not None:
+            self.edge_backend.unload()
+            self.edge_backend = None
+        self.processor = None
+        gc.collect()
+        core.DeviceManager.clear_cache()
+        print("Unloaded Hybrid HQ stages")
+
+    @staticmethod
+    def _active_output_ids(points_list, start_frame, end_frame, combined, temporal):
+        object_ids = sorted(
+            {int(point["object_id"]) for point in points_list if "object_id" in point}
+        )
+        if temporal == "MatAnyone2":
+            object_ids = [
+                object_id
+                for object_id in object_ids
+                if any(
+                    int(point.get("object_id", -1)) == object_id
+                    and start_frame <= int(point.get("frame", -1)) <= end_frame
+                    for point in points_list
+                )
+            ]
+        if combined and len(object_ids) > 1:
+            return [0]
+        return object_ids
+
+    def _create_temporal_manager(self, temporal_model):
+        if temporal_model == "VideoMaMa":
+            return VideoMaMaManager()
+        return MatAnyManager(model_name="MatAnyone2")
+
+    @staticmethod
+    def _write_edge_proposal(
+        proposal,
+        preset,
+        previous_residual=None,
+        next_residual=None,
+        current_residual=None,
+        motion_confidence=None,
+    ):
+        residual = proposal["residual"] if current_residual is None else current_residual
+        stable_residual = stabilize_edge_residual(
+            residual,
+            proposal["trimap"],
+            preset=preset,
+            previous_residual=previous_residual,
+            next_residual=next_residual,
+        )
+        merged = apply_edge_residual(proposal["temporal"], stable_residual)
+        merged16 = np.round(merged * 65535.0).astype(np.uint16)
+        if not cv2.imwrite(proposal["matte_path"], merged16):
+            raise OSError(
+                f"Failed to write Hybrid HQ matte: {proposal['matte_path']}"
+            )
+        confidence_path = proposal.get("confidence_path")
+        if motion_confidence is not None and confidence_path:
+            os.makedirs(os.path.dirname(confidence_path), exist_ok=True)
+            confidence8 = np.round(
+                np.clip(motion_confidence, 0.0, 1.0) * 255.0
+            ).astype(np.uint8)
+            if not cv2.imwrite(confidence_path, confidence8):
+                raise OSError(
+                    f"Failed to write Hybrid motion confidence: {confidence_path}"
+                )
+        proposal["written"] = True
+        unknown = proposal["trimap"] == 128
+        if not unknown.any():
+            proposal["temporal"] = None
+            proposal["trimap"] = None
+            return 0.0, 0, 0.0
+        magnitude = np.abs(stable_residual[unknown])
+        values = (
+            float(magnitude.sum()),
+            int(magnitude.size),
+            float(magnitude.max()),
+        )
+        # A written proposal remains in the 3-frame buffer only as a residual
+        # neighbor. Release its full alpha and trimap to keep 4K CPU RAM bounded.
+        proposal["temporal"] = None
+        proposal["trimap"] = None
+        return values
+
+    def _run_edge_stage(self, points_list, parent_window, combined, temporal_model):
+        settings_mgr = get_settings_manager()
+        start_frame, end_frame, frames_to_process = self._get_frame_range()
+        output_ids = self._active_output_ids(
+            points_list, start_frame, end_frame, combined, temporal_model
+        )
+        if not output_ids:
+            print("Hybrid HQ found no temporal matte outputs to refine")
+            return 0
+
+        device = core.DeviceManager.get_device()
+        self.edge_backend = MematteBackend(
+            device,
+            max_number_token=settings_mgr.get_session_setting(
+                "mematte_max_tokens", 12000
+            ),
+            precision=settings_mgr.get_session_setting(
+                "mematte_precision", "Float16"
+            ),
+        )
+        try:
+            self.edge_backend.load()
+        except MematteUnavailableError as exc:
+            print(str(exc))
+            self.edge_backend = None
+            return 0
+
+        edge_width = settings_mgr.get_session_setting("hybrid_edge_width", 12)
+        feather_width = settings_mgr.get_session_setting("hybrid_edge_feather", 4)
+        merge_preset = settings_mgr.get_session_setting(
+            "hybrid_stability_preset", PRESERVE_TEMPORAL
+        )
+        merge_config = get_hybrid_merge_preset(merge_preset)
+        motion_enabled = settings_mgr.get_session_setting(
+            "hybrid_motion_enabled", False
+        )
+        flow_resolution = settings_mgr.get_session_setting(
+            "hybrid_flow_resolution", 720
+        )
+        margin = settings_mgr.get_session_setting("mematte_roi_margin", 96)
+        tile_size = settings_mgr.get_session_setting("mematte_tile_size", 2048)
+        tile_overlap = settings_mgr.get_session_setting("mematte_tile_overlap", 128)
+        display_frequency = settings_mgr.get_app_setting("display_update_frequency", 5)
+        extension = core.get_frame_extension()
+        total_operations = frames_to_process * len(output_ids)
+        progress_dialog, pbar = self._make_progress_dialog(
+            parent_window, total_operations
+        )
+        progress_dialog.setWindowTitle("Hybrid HQ Edge Refinement")
+        temporal_dir = os.path.join(core.temp_dir, "hybrid_temporal")
+        trimap_dir = os.path.join(core.temp_dir, "hybrid_trimaps")
+        confidence_dir = os.path.join(core.temp_dir, "hybrid_motion_confidence")
+        completed = 0
+        cancelled = False
+        diagnostic_objects = []
+        print(
+            f"Hybrid HQ stability: {merge_config.name} "
+            f"(residual limit={merge_config.residual_limit:.2f}, "
+            f"temporal smoothing={merge_config.temporal_smoothing:.2f})"
+        )
+        if motion_enabled:
+            print(
+                "Hybrid HQ motion confidence: Experimental DIS "
+                f"(flow resolution={flow_resolution})"
+            )
+
+        try:
+            for object_id in output_ids:
+                pbar.set_description(f"Hybrid HQ object {object_id}")
+                proposal_buffer = []
+                residual_sum = 0.0
+                residual_count = 0
+                residual_max = 0.0
+                confidence_sum = 0.0
+                confidence_count = 0
+                for frame_number in range(start_frame, end_frame + 1):
+                    if progress_dialog.wasCanceled():
+                        cancelled = True
+                        break
+
+                    matte_path = os.path.join(
+                        core.matting_dir, f"{frame_number:05d}", f"{object_id}.png"
+                    )
+                    temporal_raw = cv2.imread(matte_path, cv2.IMREAD_UNCHANGED)
+                    if temporal_raw is None:
+                        raise OSError(f"Hybrid HQ temporal matte is missing: {matte_path}")
+                    temporal_alpha = alpha_to_float(temporal_raw)
+                    trimap = temporal_alpha_to_trimap(
+                        temporal_alpha, edge_width=edge_width
+                    )
+
+                    temporal_path = os.path.join(
+                        temporal_dir, f"{frame_number:05d}", f"{object_id}.png"
+                    )
+                    trimap_path = os.path.join(
+                        trimap_dir, f"{frame_number:05d}", f"{object_id}.png"
+                    )
+                    os.makedirs(os.path.dirname(temporal_path), exist_ok=True)
+                    os.makedirs(os.path.dirname(trimap_path), exist_ok=True)
+                    temporal16 = np.round(temporal_alpha * 65535.0).astype(np.uint16)
+                    if not cv2.imwrite(temporal_path, temporal16):
+                        raise OSError(f"Failed to save Hybrid HQ temporal matte: {temporal_path}")
+                    if not cv2.imwrite(trimap_path, trimap):
+                        raise OSError(f"Failed to save Hybrid HQ trimap: {trimap_path}")
+
+                    bgr = None
+                    if np.any(trimap == 128) or motion_enabled:
+                        frame_path = os.path.join(
+                            core.frames_dir, f"{frame_number:05d}.{extension}"
+                        )
+                        bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
+                        if bgr is None:
+                            raise OSError(f"Unable to read frame: {frame_path}")
+                    if np.any(trimap == 128):
+                        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                        spatial_alpha = self.edge_backend.predict_multi_roi_float(
+                            rgb,
+                            trimap,
+                            margin=margin,
+                            max_tile_size=tile_size,
+                            tile_overlap=tile_overlap,
+                        )
+                        residual = build_edge_residual(
+                            temporal_alpha,
+                            spatial_alpha,
+                            trimap,
+                            feather_width=feather_width,
+                            preset=merge_config.name,
+                        )
+                    else:
+                        residual = np.zeros_like(temporal_alpha, dtype=np.float32)
+
+                    proposal = {
+                        "frame_number": frame_number,
+                        "matte_path": matte_path,
+                        "temporal": temporal_alpha,
+                        "trimap": trimap,
+                        "residual": residual,
+                        "gray": (
+                            cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+                            if motion_enabled else None
+                        ),
+                        "flow_from_previous": None,
+                        "confidence_path": os.path.join(
+                            confidence_dir,
+                            f"{frame_number:05d}",
+                            f"{object_id}.png",
+                        ),
+                        "written": False,
+                    }
+                    if motion_enabled and proposal_buffer:
+                        try:
+                            proposal["flow_from_previous"] = (
+                                calculate_bidirectional_alignment(
+                                    proposal_buffer[-1]["gray"],
+                                    proposal["gray"],
+                                    max_short_side=flow_resolution,
+                                )
+                            )
+                        except (cv2.error, ValueError, RuntimeError) as exc:
+                            print(
+                                "Hybrid HQ motion alignment failed for frames "
+                                f"{proposal_buffer[-1]['frame_number']}-"
+                                f"{frame_number}; using Preserve Temporal "
+                                f"fallback: {exc}"
+                            )
+                    proposal_buffer.append(proposal)
+
+                    # The first frame has no previous neighbor, so duplicating its
+                    # own residual makes the 3-frame median equal to itself.
+                    if len(proposal_buffer) == 1:
+                        values = self._write_edge_proposal(
+                            proposal, merge_config.name
+                        )
+                        residual_sum += values[0]
+                        residual_count += values[1]
+                        residual_max = max(residual_max, values[2])
+                    elif len(proposal_buffer) == 3:
+                        previous, current, following = proposal_buffer
+                        current_residual = current["residual"]
+                        previous_residual = previous["residual"]
+                        next_residual = following["residual"]
+                        motion_confidence = None
+                        if (
+                            motion_enabled
+                            and current["flow_from_previous"] is not None
+                            and following["flow_from_previous"] is not None
+                        ):
+                            before = current["flow_from_previous"]
+                            after = following["flow_from_previous"]
+                            previous_warped, previous_confidence = (
+                                warp_source_to_target(
+                                    previous_residual,
+                                    before.flow_current_to_previous,
+                                    before.confidence_current,
+                                    current_residual.shape,
+                                )
+                            )
+                            next_warped, next_confidence = warp_source_to_target(
+                                next_residual,
+                                after.flow_previous_to_current,
+                                after.confidence_previous,
+                                current_residual.shape,
+                            )
+                            (
+                                current_residual,
+                                previous_residual,
+                                next_residual,
+                                motion_confidence,
+                            ) = motion_confidence_gate(
+                                current_residual,
+                                previous_warped,
+                                previous_confidence,
+                                next_warped,
+                                next_confidence,
+                                agreement_sigma=merge_config.motion_agreement_sigma,
+                                previous_fallback=previous["residual"],
+                                next_fallback=following["residual"],
+                            )
+                            confidence_sum += float(motion_confidence.sum())
+                            confidence_count += int(motion_confidence.size)
+                        values = self._write_edge_proposal(
+                            current,
+                            merge_config.name,
+                            previous_residual=previous_residual,
+                            next_residual=next_residual,
+                            current_residual=current_residual,
+                            motion_confidence=motion_confidence,
+                        )
+                        residual_sum += values[0]
+                        residual_count += values[1]
+                        residual_max = max(residual_max, values[2])
+                        proposal_buffer.pop(0)
+
+                    completed += 1
+                    pbar.update(1)
+                    progress_dialog.setValue(
+                        int(completed * 100 / max(total_operations, 1))
+                    )
+                    if frame_number % display_frequency == 0:
+                        parent_window.frame_slider.setValue(frame_number)
+                    QApplication.processEvents()
+                if cancelled:
+                    break
+
+                if proposal_buffer:
+                    last = proposal_buffer[-1]
+                    if not last["written"]:
+                        previous_residual = (
+                            proposal_buffer[-2]["residual"]
+                            if len(proposal_buffer) > 1
+                            else None
+                        )
+                        values = self._write_edge_proposal(
+                            last,
+                            merge_config.name,
+                            previous_residual=previous_residual,
+                        )
+                        residual_sum += values[0]
+                        residual_count += values[1]
+                        residual_max = max(residual_max, values[2])
+                mean_residual = residual_sum / max(residual_count, 1)
+                print(
+                    f"Hybrid HQ object {object_id}: accepted residual "
+                    f"mean={mean_residual:.6f}, max={residual_max:.6f}"
+                )
+                if motion_enabled:
+                    mean_confidence = confidence_sum / max(confidence_count, 1)
+                    print(
+                        f"Hybrid HQ object {object_id}: motion confidence "
+                        f"mean={mean_confidence:.6f}"
+                    )
+                else:
+                    mean_confidence = None
+                diagnostic_objects.append(
+                    {
+                        "object_id": int(object_id),
+                        "accepted_residual_mean": float(mean_residual),
+                        "accepted_residual_max": float(residual_max),
+                        "motion_confidence_mean": (
+                            float(mean_confidence)
+                            if mean_confidence is not None else None
+                        ),
+                    }
+                )
+        finally:
+            pbar.close()
+            progress_dialog.close()
+            self.edge_backend.unload()
+            self.edge_backend = None
+            gc.collect()
+            core.DeviceManager.clear_cache()
+
+        if cancelled:
+            print("Hybrid HQ edge refinement cancelled")
+            return 0
+        diagnostic_dir = os.path.join(core.temp_dir, "hybrid_diagnostics")
+        os.makedirs(diagnostic_dir, exist_ok=True)
+        report_name = "_".join(
+            (
+                temporal_model.lower(),
+                merge_config.name.lower().replace(" ", "_"),
+                "motion" if motion_enabled else "phase41",
+            )
+        ) + ".json"
+        report_path = os.path.join(diagnostic_dir, report_name)
+        with open(report_path, "w", encoding="utf-8") as report_file:
+            json.dump(
+                {
+                    "phase": "4.2" if motion_enabled else "4.1",
+                    "temporal_model": temporal_model,
+                    "stability_preset": merge_config.name,
+                    "motion_enabled": bool(motion_enabled),
+                    "flow_resolution": int(flow_resolution),
+                    "frame_range": [int(start_frame), int(end_frame)],
+                    "objects": diagnostic_objects,
+                },
+                report_file,
+                indent=2,
+            )
+        print(f"Hybrid HQ diagnostics: {report_path}")
+        return 1
+
+    def _run_evaluation_stage(
+        self, points_list, parent_window, combined, temporal_model
+    ):
+        settings_mgr = get_settings_manager()
+        start_frame, end_frame, _ = self._get_frame_range()
+        output_ids = self._active_output_ids(
+            points_list, start_frame, end_frame, combined, temporal_model
+        )
+        if not output_ids:
+            print("Hybrid HQ evaluation found no output objects")
+            return None
+
+        stability = settings_mgr.get_session_setting(
+            "hybrid_stability_preset", PRESERVE_TEMPORAL
+        )
+        motion_enabled = settings_mgr.get_session_setting(
+            "hybrid_motion_enabled", False
+        ) is True
+        flow_resolution = int(
+            settings_mgr.get_session_setting("hybrid_flow_resolution", 720)
+        )
+        requested_label = settings_mgr.get_session_setting(
+            "hybrid_evaluation_label", ""
+        ).strip()
+        run_label = requested_label or "_".join(
+            (
+                temporal_model.lower(),
+                stability.lower().replace(" ", "_"),
+                f"motion{flow_resolution}" if motion_enabled else "phase41",
+            )
+        )
+        progress = QProgressDialog(
+            "Preparing Hybrid HQ evaluation...", "Cancel", 0, 100, parent_window
+        )
+        progress.setWindowTitle("Hybrid HQ Phase 4.3 Evaluation")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setAutoClose(True)
+        progress.show()
+
+        def update(completed, total, message):
+            progress.setLabelText(message)
+            progress.setValue(int(completed * 100 / max(total, 1)))
+            QApplication.processEvents()
+
+        try:
+            report_path = evaluate_hybrid_run(
+                frames_dir=core.frames_dir,
+                matting_dir=core.matting_dir,
+                temporal_dir=os.path.join(core.temp_dir, "hybrid_temporal"),
+                trimap_dir=os.path.join(core.temp_dir, "hybrid_trimaps"),
+                confidence_dir=os.path.join(
+                    core.temp_dir, "hybrid_motion_confidence"
+                ),
+                output_root=os.path.join(core.temp_dir, "hybrid_evaluation"),
+                frame_range=(start_frame, end_frame),
+                object_ids=output_ids,
+                frame_extension=core.get_frame_extension(),
+                run_label=run_label,
+                settings={
+                    "temporal_model": temporal_model,
+                    "stability_preset": stability,
+                    "motion_enabled": motion_enabled,
+                    "flow_resolution": flow_resolution,
+                    "edge_width": settings_mgr.get_session_setting(
+                        "hybrid_edge_width", 12
+                    ),
+                    "edge_feather": settings_mgr.get_session_setting(
+                        "hybrid_edge_feather", 4
+                    ),
+                },
+                flow_resolution=flow_resolution,
+                progress_callback=update,
+                cancel_callback=progress.wasCanceled,
+            )
+            print(f"Hybrid HQ Phase 4.3 evaluation: {report_path}")
+            return report_path
+        except HybridEvaluationCancelled:
+            print("Hybrid HQ Phase 4.3 evaluation cancelled; mattes were preserved")
+        except Exception as exc:
+            print(
+                "Hybrid HQ Phase 4.3 evaluation failed; mattes were preserved: "
+                f"{exc}"
+            )
+        finally:
+            progress.close()
+        return None
+
+    def run_matting(self, points_list, parent_window, combined=False):
+        settings_mgr = get_settings_manager()
+        temporal_model = settings_mgr.get_session_setting(
+            "hybrid_temporal_model", "MatAnyone2"
+        )
+        if temporal_model not in {"MatAnyone2", "VideoMaMa"}:
+            raise ValueError(f"Unsupported Hybrid HQ temporal model: {temporal_model}")
+        if core.DeviceManager.get_device().type == "cpu" and temporal_model == "VideoMaMa":
+            print("Hybrid HQ with VideoMaMa is not supported on CPU")
+            return 0
+
+        device = core.DeviceManager.get_device()
+        start_frame, end_frame, frames_to_process = self._get_frame_range()
+        output_ids = self._active_output_ids(
+            points_list, start_frame, end_frame, combined, temporal_model
+        )
+        frame_equivalents = frames_to_process * max(1, len(output_ids))
+        memory_profile = settings_mgr.get_session_setting(
+            "memory_profile", "Custom"
+        )
+        performance_enabled = settings_mgr.get_session_setting(
+            "performance_metrics_enabled", True
+        ) is True
+        profiler = MattingRunProfiler(device)
+        run_status = "failed"
+        evaluation_enabled = settings_mgr.get_session_setting(
+            "hybrid_evaluation_enabled", False
+        ) is True
+        stage_count = 3 if evaluation_enabled else 2
+        try:
+            print(f"Hybrid HQ stage 1/{stage_count}: {temporal_model} temporal matte")
+            with profiler.stage("temporal", frame_equivalents):
+                self.temporal_manager = self._create_temporal_manager(temporal_model)
+                try:
+                    if not self.temporal_manager.load_matting_model(
+                        parent_window=parent_window
+                    ):
+                        run_status = "temporal_load_failed"
+                        return 0
+                    temporal_result = self.temporal_manager.run_matting(
+                        points_list, parent_window=parent_window, combined=combined
+                    )
+                    temporal_propagated = self.temporal_manager.propagated
+                finally:
+                    if self.temporal_manager is not None:
+                        self.temporal_manager.unload_matting_model()
+                    self.temporal_manager = None
+                    gc.collect()
+                    core.DeviceManager.clear_cache()
+
+            if temporal_result != 1:
+                run_status = "temporal_incomplete"
+                return 0
+
+            print(
+                f"Hybrid HQ stage 2/{stage_count}: MEMatte uncertain-edge refinement"
+            )
+            with profiler.stage("edge", frame_equivalents):
+                edge_result = self._run_edge_stage(
+                    points_list, parent_window, combined, temporal_model
+                )
+            self.propagated = bool(edge_result and temporal_propagated)
+            if not edge_result:
+                run_status = "edge_incomplete"
+                return 0
+
+            if evaluation_enabled:
+                print("Hybrid HQ stage 3/3: no-reference evaluation and archive")
+                with profiler.stage("evaluation", frame_equivalents):
+                    self._run_evaluation_stage(
+                        points_list, parent_window, combined, temporal_model
+                    )
+            run_status = "completed"
+            print("Hybrid HQ matting completed")
+            self._notify("matting_complete")
+            return 1
+        finally:
+            if performance_enabled and profiler.stages:
+                try:
+                    report_path = write_performance_report(
+                        os.path.join(core.temp_dir, "hybrid_performance"),
+                        label=f"{temporal_model}_{memory_profile}",
+                        metadata={
+                            "status": run_status,
+                            "model": "Hybrid HQ",
+                            "temporal_model": temporal_model,
+                            "memory_profile": memory_profile,
+                            "start_frame": int(start_frame),
+                            "end_frame": int(end_frame),
+                            "objects": len(output_ids),
+                            "matany_res": settings_mgr.get_session_setting(
+                                "matany_res", 720
+                            ),
+                            "matany_chunk": settings_mgr.get_session_setting(
+                                "matany_chunk", 16
+                            ),
+                            "mematte_tile_size": settings_mgr.get_session_setting(
+                                "mematte_tile_size", 2048
+                            ),
+                            "mematte_max_tokens": settings_mgr.get_session_setting(
+                                "mematte_max_tokens", 12000
+                            ),
+                            "hybrid_flow_resolution": settings_mgr.get_session_setting(
+                                "hybrid_flow_resolution", 720
+                            ),
+                        },
+                        profiler=profiler,
+                        frame_equivalents=frame_equivalents,
+                    )
+                    print(f"Hybrid HQ performance: {report_path}")
+                except Exception as exc:
+                    print(f"Hybrid HQ performance report failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # VideoMaMa backend
 # ---------------------------------------------------------------------------
 
@@ -799,6 +1605,10 @@ class VideoMaMaManager(MattingManager):
     """
 
     BACKEND = "videomama"
+
+    def __init__(self):
+        super().__init__()
+        self.pipeline = None
 
     def unload_matting_model(self):
         """Unload the VideoMaMa pipeline and free VRAM"""
@@ -1301,6 +2111,10 @@ def create_matting_manager() -> MattingManager:
     matting_model = settings_mgr.get_session_setting("matany_model", "MatAnyone")
     if matting_model == "ViTMatte":
         return VitMatteManager()
+    if matting_model == "MEMatte":
+        return MematteManager()
+    if matting_model == "Hybrid HQ":
+        return HybridHQManager()
     if matting_model == "VideoMaMa":
         return VideoMaMaManager()
     return MatAnyManager()

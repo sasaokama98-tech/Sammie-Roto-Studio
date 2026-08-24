@@ -35,6 +35,9 @@ legacy runtimes until compatibility tests pass.
 - Add an optional official SAM3 dependency (`uv sync --extra sam31`).
 - Adapt point prompts, object IDs, forward/backward propagation, reset,
   remove-object, and session close without changing the existing mask layout.
+- Convert UI points from original-frame pixels to normalized 0..1 coordinates
+  before using SAM 3.1's relative-coordinate point API. Passing source pixels
+  directly as model-space coordinates breaks selection on non-1008 footage.
 - Stage PNG/TIFF frames as high-quality JPEG only for SAM 3.1 model input.
   Original footage remains the source for display, matting, and export.
 - Generate automatic 0/128/255 trimaps next to each coarse mask under
@@ -60,6 +63,29 @@ PyTorch 2.11. The Windows PyTorch build can omit Flash SDPA even though SAM
 and limits the SAM 3.1 decoder to cuDNN, Efficient Attention, then Math SDPA.
 This avoids the `No available kernel` propagation failure without changing
 global PyTorch backend selection.
+
+The official multiplex builder performs multiple non-strict checkpoint loads
+and prints every missing/unexpected key, even when the assembled predictor
+loads successfully. Sammie Roto Studio suppresses only those verbose key-list
+lines and emits one compatibility summary so the console remains readable.
+Set `SAM31_VERBOSE_CHECKPOINT_KEYS=1` before launch to restore the complete
+official diagnostic output when debugging a checkpoint mismatch.
+
+### SAM 3.1 follow-up — prompt selection mode
+
+Add a prompt-driven selection workflow only while `SAM 3.1` is selected:
+
+1. Show a text prompt field and **Select by Prompt** action without changing
+   the point tools used by SAM2/EfficientTAM.
+2. Send the prompt through SAM 3.1's semantic `add_prompt` request and display
+   the returned candidates before committing them to Sammie object IDs.
+3. Let the user accept one or more candidates, then use the existing positive/
+   negative points for instance refinement and tracking.
+4. Treat a new semantic prompt as an explicit session reseed. The official
+   multiplex implementation resets semantic state when applying a text prompt,
+   so it must not silently erase existing point objects or masks.
+5. Preserve prompt text and candidate-to-object mappings in session settings so
+   replay and project reopening are deterministic.
 
 
 ## Phase 2 — ViTMatte image matting (complete)
@@ -90,23 +116,93 @@ Implemented:
 
 See `PHASE2_VALIDATION.md` and the JSON benchmark outputs for measurements.
 
-## Phase 3 — MEMatte high-resolution backend
+## Phase 3 — MEMatte high-resolution backend (adapter implemented)
 
-1. Resolve code/checkpoint licensing before distribution.
-2. Add `max-number-token`, ROI margin, and tile-overlap settings.
-3. Avoid full-frame 4K inference by deriving a padded object bounding box from
-   the coarse mask and unknown trimap band.
-4. Add seam-free ROI reintegration and half/float precision validation for EXR.
+Implemented:
 
-## Phase 4 — Hybrid HQ
+- External-source adapter for the official `linyiheng123/MEMatte` ViTS model;
+  no MEMatte source or checkpoint is redistributed.
+- Conventional local paths plus `MEMATTE_REPO_PATH` and
+  `MEMATTE_CHECKPOINT_PATH` overrides.
+- Minimal inference-only compatibility layer for the detectron2/fvcore/
+  fairscale symbols used by the official model, avoiding a legacy detectron2
+  install in the current Windows/Torch 2.11 environment.
+- Configurable `max-number-token`, ROI margin, tile size, tile overlap, and
+  Float16/BFloat16/Float32 CUDA inference settings.
+- Connected unknown-band/object ROIs and feathered overlapping tiles, so 2K/4K
+  frames do not require unconditional full-frame inference.
+- The same 16-bit PNG intermediate and float32 EXR path validated in Phase 2.
+- Unit coverage for path resolution, checkpoint normalization, trimap input,
+  token controls, tiled reintegration, and known-region preservation.
 
-1. Use MatAnyone2 or VideoMaMa alpha as the temporally stable base.
-2. Derive foreground core, definite background, and uncertain edge bands.
-3. Run MEMatte only on uncertain edge ROIs.
-4. Merge with confidence-weighted feathering and optional short-window temporal
-   stabilization; never replace the full temporal alpha unconditionally.
-5. Expose Memory Safe/Balanced/Fast policies controlling model residency,
-   image size, ROI batching, and token limits.
+Pending validation:
+
+- Run the official ViTS AIM-500 and DIM checkpoints on the 2K/4K fixture and
+  record peak VRAM, time, edge scores, and Float16/BFloat16/Float32 deltas.
+- Obtain an explicit standalone upstream license file or maintainer
+  confirmation before any redistribution of code or checkpoint files.
+
+See `PHASE3_MEMATTE.md` for local runtime setup and current limitations.
+
+## Phase 4 — Hybrid HQ (Phase 4.3 implemented)
+
+Implemented:
+
+- Selectable MatAnyone2 or VideoMaMa temporal base.
+- Strict staged lifecycle: finish and unload the temporal model, clear CUDA,
+  then load MEMatte. The two large models never share VRAM residency.
+- Temporal-alpha trimap generation combining soft-alpha uncertainty with a
+  configurable morphological safety band.
+- MEMatte inference only over connected unknown-band ROIs and tiles.
+- Distance-weighted edge feathering. Known foreground/background retain the
+  temporal alpha exactly; the full alpha is never replaced unconditionally.
+- 16-bit Hybrid output plus diagnostic temporal mattes and trimaps under
+  `temp/hybrid_temporal` and `temp/hybrid_trimaps`.
+- GUI controls for temporal base, edge width, edge feather, and the existing
+  MEMatte ROI/tile/token/precision settings.
+- Preserve Temporal/Balanced/Maximum Detail residual policies and opt-in
+  bidirectional motion confidence.
+- Named Phase 4.3 evaluation archives with temporal/final/confidence mattes,
+  per-frame JSON diagnostics, and an append-only comparison CSV.
+
+Pending validation and follow-up:
+
+- Compare MatAnyone2 and VideoMaMa bases on the full VFX fixture and record
+  edge detail, flicker, VRAM, and time.
+- Tune edge width/feather defaults for hair, motion blur, and defocus.
+- Add ground-truth SAD/MSE/Grad/Conn and formal dtSSD fixture scoring; current
+  Phase 4.3 metrics are intentionally no-reference comparisons.
+See `PHASE4_HYBRID_HQ.md` for processing semantics and controls.
+
+## Phase 5 — Memory/performance profiles (implemented)
+
+Implemented:
+
+- `Memory Safe`, `Balanced`, and `Fast` profiles covering temporal resolution,
+  VideoMaMa batch/overlap, ViTMatte and MEMatte ROI/tile settings, MEMatte
+  token/precision settings, and Hybrid flow resolution.
+- `Custom` is selected automatically when a managed setting is edited.
+- Existing sessions without profile metadata remain `Custom`; new sessions
+  use the configurable `Balanced` default.
+- Strict large-model staged unload remains mandatory in every profile,
+  including `Fast`.
+
+Pending validation:
+
+- Record peak VRAM and frame time for all three profiles on matched 2K/4K
+  sequences, then adjust the initial thresholds if necessary.
+
+See `PHASE5_MEMORY_PROFILES.md` for the exact profile matrix.
+
+### Phase 5.1 — Performance telemetry (implemented)
+
+- Hybrid HQ records temporal, MEMatte edge, and optional evaluation stages
+  independently.
+- JSON reports include elapsed time, seconds per frame-equivalent, and CUDA
+  peak allocated/reserved memory.
+- `temp/hybrid_performance/summary.csv` provides one reproducible comparison
+  row per run, including the active profile and core numerical settings.
+- Telemetry is optional and cannot fail or alter an otherwise successful matte.
 
 ## Validation matrix
 
@@ -124,8 +220,9 @@ round-trips in Nuke before enabling a backend by default.
   privacy, reverse-engineering, and prohibited-end-use clauses.
 - ViTMatte code declares MIT. Check the separately downloaded checkpoint and
   training-dataset terms before commercial redistribution.
-- MEMatte's README states MIT, but the repository tree reviewed on 2026-08-19
-  did not contain a standalone LICENSE file. Obtain an explicit license file or
+- MEMatte's README states MIT, but upstream commit
+  `3c887e2a517b38f936b97f27d933c5897c6d47a1` reviewed on 2026-08-20 still did
+  not contain a standalone LICENSE file. Obtain an explicit license file or
   maintainer confirmation before vendoring or shipping its code/checkpoints.
 
 Primary references:

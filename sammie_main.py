@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QFileDialog, QVBoxLayout, QHBoxLayout, 
     QGridLayout, QWidget, QPushButton, QLabel, QStatusBar, QSlider, 
     QTabWidget, QSpinBox, QComboBox, QSplitter, QGroupBox, QTextEdit,
-    QCheckBox, QLineEdit, QMessageBox, QDialog
+    QCheckBox, QLineEdit, QMessageBox, QDialog, QScrollArea, QSizePolicy
 )
 from PySide6.QtGui import (
     QAction, QShortcut, QKeySequence, QTextCursor, QIcon, QPixmap, QFont, QDesktopServices
@@ -29,6 +29,22 @@ from sammie.export_dialog import ExportDialog
 from sammie.settings_dialog import SettingsDialog
 from sammie.settings_manager import get_settings_manager, initialize_settings, ApplicationSettings
 from sammie.branding import APP_DESCRIPTION, APP_NAME
+from sammie.hybrid_hq import BALANCED, MAXIMUM_DETAIL, PRESERVE_TEMPORAL
+from sammie.memory_profiles import (
+    CUSTOM as CUSTOM_MEMORY_PROFILE,
+    PROFILE_NAMES as MEMORY_PROFILE_NAMES,
+    apply_memory_profile,
+    get_memory_profile,
+)
+from sammie.frame_display import (
+    FRAME_INDEX_MODE,
+    SOURCE_FRAME_MODE,
+    available_frame_display_modes,
+    format_frame_value,
+    format_in_out_range,
+    infer_contiguous_sequence_metadata,
+    sequence_frame_metadata,
+)
 
 # Import GUI widgets
 from sammie.gui_widgets import (
@@ -216,6 +232,23 @@ class SegmentationTab(QWidget):
         tracking_group = QGroupBox("Tracking")
         tracking_layout = QVBoxLayout(tracking_group)
 
+        self.sam31_anchor_notice = QLabel(
+            "SAM 3.1 Track Objects: place point anchors on either the first "
+            "(In) frame or the last (Out) frame. Out-frame anchors track backward. "
+            "If native point propagation loses the object, the selected SAM 3.1 "
+            "anchor mask is propagated through the compatibility tracker."
+        )
+        self.sam31_anchor_notice.setWordWrap(True)
+        self.sam31_anchor_notice.setStyleSheet(
+            "QLabel { background-color: #4a3c16; color: #f3d77a; padding: 7px; "
+            "border: 1px solid #80671f; border-radius: 4px; }"
+        )
+        tracking_layout.addWidget(self.sam31_anchor_notice)
+        self.sam_model_combo.currentTextChanged.connect(
+            self._update_sam31_anchor_notice
+        )
+        self._update_sam31_anchor_notice(self.sam_model_combo.currentText())
+
         # Track Objects button (full propagation)
         self.track_objects_btn = QPushButton(" Track Objects ")
         self.track_objects_btn.setToolTip("Propagate segmentation masks to all frames using the added points as guidance")
@@ -268,6 +301,9 @@ class SegmentationTab(QWidget):
         self.deduplicate_masks_btn.setLayoutDirection(Qt.RightToLeft)
 
         layout.addWidget(tracking_group)
+
+    def _update_sam31_anchor_notice(self, model_name):
+        self.sam31_anchor_notice.setVisible(model_name == "SAM 3.1")
     
     def _create_parameter_sliders(self, layout):
         """Create parameter adjustment sliders"""
@@ -431,8 +467,19 @@ class MattingTab(QWidget):
     
     def _init_ui(self):
         """Initialize the matting tab layout"""
-        layout = QVBoxLayout(self)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.content_scroll.setFrameShape(QScrollArea.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        self.content_scroll.setWidget(content)
+        outer_layout.addWidget(self.content_scroll)
         settings_mgr = get_settings_manager()
+        self._applying_memory_profile = False
+        self._loading_memory_settings = False
         
         # Instructions
         self._create_instructions_section(layout)
@@ -449,18 +496,62 @@ class MattingTab(QWidget):
         layout.addWidget(matting_group)
         
         # MatAnyone Processing settings
-        processing_group = QGroupBox("Processing Settings")
-        processing_layout = QVBoxLayout(processing_group)
+        self.processing_group = QGroupBox("Processing Settings")
+        self.processing_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.processing_group.setStyleSheet(
+            "QLabel, QCheckBox, QComboBox, QSpinBox { font-size: 11px; }"
+        )
+        processing_layout = QVBoxLayout(self.processing_group)
+        processing_layout.setSpacing(4)
+        memory_layout = QHBoxLayout()
         model_layout = QHBoxLayout()
         res_layout = QHBoxLayout()
         overlap_layout = QHBoxLayout()
         chunk_layout = QHBoxLayout()
+
+        memory_label = QLabel("Memory Profile:")
+        self.memory_profile_combo = QComboBox()
+        self.memory_profile_combo.addItems(MEMORY_PROFILE_NAMES)
+        memory_profile = settings_mgr.get_session_setting(
+            "memory_profile", CUSTOM_MEMORY_PROFILE
+        )
+        if memory_profile not in MEMORY_PROFILE_NAMES:
+            memory_profile = CUSTOM_MEMORY_PROFILE
+        self.memory_profile_combo.setCurrentText(memory_profile)
+        self.memory_profile_combo.setToolTip(
+            "Memory Safe uses smaller tiles and batches. Balanced is the "
+            "recommended default. Fast uses more VRAM for larger batches and "
+            "tiles. Editing a managed value switches to Custom. Large Hybrid "
+            "HQ models are always unloaded between stages."
+        )
+        self.performance_metrics_checkbox = QCheckBox(
+            "Record Performance Metrics"
+        )
+        self.performance_metrics_checkbox.setChecked(
+            settings_mgr.get_session_setting(
+                "performance_metrics_enabled", True
+            )
+        )
+        self.performance_metrics_checkbox.setToolTip(
+            "Write Hybrid HQ stage timings and CUDA peak memory to "
+            "temp/hybrid_performance after each run."
+        )
         
         model_label = QLabel("Model:")
         self.matany_model_combo = QComboBox()
-        self.matany_model_combo.addItems(["MatAnyone", "MatAnyone2", "VideoMaMa", "ViTMatte"])
+        self.matany_model_combo.addItems(
+            [
+                "MatAnyone",
+                "MatAnyone2",
+                "VideoMaMa",
+                "ViTMatte",
+                "MEMatte",
+                "Hybrid HQ",
+            ]
+        )
         self.matany_model_combo.setToolTip(
-            "ViTMatte refines each frame from the original image and trimap."
+            "ViTMatte and MEMatte refine each frame from the original image "
+            "and trimap. Hybrid HQ preserves a temporal base and refines only edges."
         )
 
         res_label = QLabel("Internal Resolution:")
@@ -520,6 +611,160 @@ class MattingTab(QWidget):
         self.vitmatte_overlap_spin.setValue(
             settings_mgr.get_session_setting("vitmatte_tile_overlap", 128)
         )
+        self.mematte_margin_label = QLabel("MEMatte ROI Margin:")
+        self.mematte_margin_spin = QSpinBox()
+        self.mematte_margin_spin.setRange(0, 1024)
+        self.mematte_margin_spin.setSuffix(" px")
+        self.mematte_margin_spin.setValue(
+            settings_mgr.get_session_setting("mematte_roi_margin", 96)
+        )
+        self.mematte_tile_label = QLabel("MEMatte Tile Size:")
+        self.mematte_tile_spin = QSpinBox()
+        self.mematte_tile_spin.setRange(512, 4096)
+        self.mematte_tile_spin.setSingleStep(128)
+        self.mematte_tile_spin.setValue(
+            settings_mgr.get_session_setting("mematte_tile_size", 2048)
+        )
+        self.mematte_overlap_label = QLabel("MEMatte Tile Overlap:")
+        self.mematte_overlap_spin = QSpinBox()
+        self.mematte_overlap_spin.setRange(0, 512)
+        self.mematte_overlap_spin.setSingleStep(32)
+        self.mematte_overlap_spin.setValue(
+            settings_mgr.get_session_setting("mematte_tile_overlap", 128)
+        )
+        self.mematte_tokens_label = QLabel("Max Global Tokens:")
+        self.mematte_tokens_spin = QSpinBox()
+        self.mematte_tokens_spin.setRange(1024, 65536)
+        self.mematte_tokens_spin.setSingleStep(1024)
+        self.mematte_tokens_spin.setValue(
+            settings_mgr.get_session_setting("mematte_max_tokens", 12000)
+        )
+        self.mematte_tokens_spin.setToolTip(
+            "Lower values reduce global-attention VRAM usage. The official "
+            "MEMatte example uses 18000."
+        )
+        self.mematte_precision_label = QLabel("MEMatte Precision:")
+        self.mematte_precision_combo = QComboBox()
+        self.mematte_precision_combo.addItems(["Float16", "BFloat16", "Float32"])
+        self.mematte_precision_combo.setCurrentText(
+            settings_mgr.get_session_setting("mematte_precision", "Float16")
+        )
+        self.hybrid_temporal_label = QLabel("Hybrid Temporal Base:")
+        self.hybrid_temporal_combo = QComboBox()
+        self.hybrid_temporal_combo.addItems(["MatAnyone2", "VideoMaMa"])
+        self.hybrid_temporal_combo.setCurrentText(
+            settings_mgr.get_session_setting(
+                "hybrid_temporal_model", "MatAnyone2"
+            )
+        )
+        self.hybrid_temporal_combo.setToolTip(
+            "Temporal alpha is completed and unloaded before MEMatte is loaded."
+        )
+        self.hybrid_stability_label = QLabel("Hybrid Stability:")
+        self.hybrid_stability_combo = QComboBox()
+        self.hybrid_stability_combo.addItems(
+            [PRESERVE_TEMPORAL, BALANCED, MAXIMUM_DETAIL]
+        )
+        self.hybrid_stability_combo.setCurrentText(
+            settings_mgr.get_session_setting(
+                "hybrid_stability_preset", PRESERVE_TEMPORAL
+            )
+        )
+        self.hybrid_stability_combo.setToolTip(
+            "Preserve Temporal limits and stabilizes MEMatte changes. Balanced "
+            "accepts more edge detail. Maximum Detail uses the original "
+            "frame-independent Hybrid HQ merge."
+        )
+        self.hybrid_motion_checkbox = QCheckBox(
+            "Motion Confidence (Experimental)"
+        )
+        self.hybrid_motion_checkbox.setChecked(
+            settings_mgr.get_session_setting("hybrid_motion_enabled", False)
+        )
+        self.hybrid_motion_checkbox.setToolTip(
+            "Use bidirectional DIS optical flow to align neighboring MEMatte "
+            "residuals. Unreliable flow and occlusions fall back to the selected "
+            "Phase 4.1 stability preset."
+        )
+        self.hybrid_flow_resolution_label = QLabel("Flow Resolution:")
+        self.hybrid_flow_resolution_combo = QComboBox()
+        self.hybrid_flow_resolution_combo.addItems(["480", "720", "1080"])
+        self.hybrid_flow_resolution_combo.setCurrentText(
+            str(settings_mgr.get_session_setting("hybrid_flow_resolution", 720))
+        )
+        self.hybrid_flow_resolution_combo.setEnabled(
+            self.hybrid_motion_checkbox.isChecked()
+        )
+        self.hybrid_flow_resolution_combo.setToolTip(
+            "Maximum short-side resolution used for CPU optical flow. Higher "
+            "values improve small-motion alignment but increase processing time."
+        )
+        self.hybrid_evaluation_checkbox = QCheckBox("Save Evaluation Run")
+        self.hybrid_evaluation_checkbox.setChecked(
+            settings_mgr.get_session_setting("hybrid_evaluation_enabled", False)
+        )
+        self.hybrid_evaluation_checkbox.setToolTip(
+            "Archive temporal/final mattes and confidence images, then write "
+            "Phase 4.3 no-reference comparison metrics. This uses additional disk space."
+        )
+        self.hybrid_evaluation_label = QLabel("Evaluation Label:")
+        self.hybrid_evaluation_edit = QLineEdit()
+        self.hybrid_evaluation_edit.setPlaceholderText("Automatic")
+        self.hybrid_evaluation_edit.setText(
+            settings_mgr.get_session_setting("hybrid_evaluation_label", "")
+        )
+        self.hybrid_evaluation_edit.setEnabled(
+            self.hybrid_evaluation_checkbox.isChecked()
+        )
+        self.hybrid_evaluation_edit.setToolTip(
+            "Optional run name used under temp/hybrid_evaluation. Existing runs "
+            "are never overwritten."
+        )
+        self.hybrid_edge_label = QLabel("Hybrid Edge Width:")
+        self.hybrid_edge_spin = QSpinBox()
+        self.hybrid_edge_spin.setRange(0, 256)
+        self.hybrid_edge_spin.setSuffix(" px")
+        self.hybrid_edge_spin.setValue(
+            settings_mgr.get_session_setting("hybrid_edge_width", 12)
+        )
+        self.hybrid_feather_label = QLabel("Hybrid Edge Feather:")
+        self.hybrid_feather_spin = QSpinBox()
+        self.hybrid_feather_spin.setRange(0, 64)
+        self.hybrid_feather_spin.setSuffix(" px")
+        self.hybrid_feather_spin.setValue(
+            settings_mgr.get_session_setting("hybrid_edge_feather", 4)
+        )
+
+        fixed_row_widgets = (
+            self.memory_profile_combo,
+            self.performance_metrics_checkbox,
+            self.matany_model_combo,
+            self.matany_res_combo,
+            self.overlap_combo,
+            self.chunk_combo,
+            self.combined_mask_checkbox,
+            self.trimap_auto_checkbox,
+            self.trimap_fg_spin,
+            self.trimap_bg_spin,
+            self.vitmatte_margin_spin,
+            self.vitmatte_tile_spin,
+            self.vitmatte_overlap_spin,
+            self.mematte_margin_spin,
+            self.mematte_tile_spin,
+            self.mematte_overlap_spin,
+            self.mematte_tokens_spin,
+            self.mematte_precision_combo,
+            self.hybrid_temporal_combo,
+            self.hybrid_stability_combo,
+            self.hybrid_motion_checkbox,
+            self.hybrid_flow_resolution_combo,
+            self.hybrid_evaluation_checkbox,
+            self.hybrid_evaluation_edit,
+            self.hybrid_edge_spin,
+            self.hybrid_feather_spin,
+        )
+        for widget in fixed_row_widgets:
+            widget.setFixedHeight(26)
         trimap_layout = QGridLayout()
         trimap_layout.addWidget(self.trimap_auto_checkbox, 0, 0, 1, 2)
         trimap_layout.addWidget(QLabel("FG Erode:"), 1, 0)
@@ -532,6 +777,30 @@ class MattingTab(QWidget):
         trimap_layout.addWidget(self.vitmatte_tile_spin, 4, 1)
         trimap_layout.addWidget(self.vitmatte_overlap_label, 5, 0)
         trimap_layout.addWidget(self.vitmatte_overlap_spin, 5, 1)
+        trimap_layout.addWidget(self.mematte_margin_label, 6, 0)
+        trimap_layout.addWidget(self.mematte_margin_spin, 6, 1)
+        trimap_layout.addWidget(self.mematte_tile_label, 7, 0)
+        trimap_layout.addWidget(self.mematte_tile_spin, 7, 1)
+        trimap_layout.addWidget(self.mematte_overlap_label, 8, 0)
+        trimap_layout.addWidget(self.mematte_overlap_spin, 8, 1)
+        trimap_layout.addWidget(self.mematte_tokens_label, 9, 0)
+        trimap_layout.addWidget(self.mematte_tokens_spin, 9, 1)
+        trimap_layout.addWidget(self.mematte_precision_label, 10, 0)
+        trimap_layout.addWidget(self.mematte_precision_combo, 10, 1)
+        trimap_layout.addWidget(self.hybrid_temporal_label, 11, 0)
+        trimap_layout.addWidget(self.hybrid_temporal_combo, 11, 1)
+        trimap_layout.addWidget(self.hybrid_stability_label, 12, 0)
+        trimap_layout.addWidget(self.hybrid_stability_combo, 12, 1)
+        trimap_layout.addWidget(self.hybrid_motion_checkbox, 13, 0, 1, 2)
+        trimap_layout.addWidget(self.hybrid_flow_resolution_label, 14, 0)
+        trimap_layout.addWidget(self.hybrid_flow_resolution_combo, 14, 1)
+        trimap_layout.addWidget(self.hybrid_evaluation_checkbox, 15, 0, 1, 2)
+        trimap_layout.addWidget(self.hybrid_evaluation_label, 16, 0)
+        trimap_layout.addWidget(self.hybrid_evaluation_edit, 16, 1)
+        trimap_layout.addWidget(self.hybrid_edge_label, 17, 0)
+        trimap_layout.addWidget(self.hybrid_edge_spin, 17, 1)
+        trimap_layout.addWidget(self.hybrid_feather_label, 18, 0)
+        trimap_layout.addWidget(self.hybrid_feather_spin, 18, 1)
 
         # Connect to save settings when changed
         self.matany_model_combo.currentTextChanged.connect(self._save_model_setting)
@@ -551,7 +820,61 @@ class MattingTab(QWidget):
         self.vitmatte_margin_spin.valueChanged.connect(self._save_trimap_settings)
         self.vitmatte_tile_spin.valueChanged.connect(self._save_trimap_settings)
         self.vitmatte_overlap_spin.valueChanged.connect(self._save_trimap_settings)
+        self.mematte_margin_spin.valueChanged.connect(self._save_trimap_settings)
+        self.mematte_tile_spin.valueChanged.connect(self._save_trimap_settings)
+        self.mematte_overlap_spin.valueChanged.connect(self._save_trimap_settings)
+        self.mematte_tokens_spin.valueChanged.connect(self._save_trimap_settings)
+        self.mematte_precision_combo.currentTextChanged.connect(
+            self._save_trimap_settings
+        )
+        self.hybrid_temporal_combo.currentTextChanged.connect(
+            self._save_hybrid_settings
+        )
+        self.hybrid_stability_combo.currentTextChanged.connect(
+            self._save_hybrid_settings
+        )
+        self.hybrid_motion_checkbox.stateChanged.connect(
+            self._save_hybrid_settings
+        )
+        self.hybrid_flow_resolution_combo.currentTextChanged.connect(
+            self._save_hybrid_settings
+        )
+        self.hybrid_evaluation_checkbox.stateChanged.connect(
+            self._save_hybrid_settings
+        )
+        self.hybrid_evaluation_edit.textChanged.connect(
+            self._save_hybrid_settings
+        )
+        self.hybrid_edge_spin.valueChanged.connect(self._save_hybrid_settings)
+        self.hybrid_feather_spin.valueChanged.connect(self._save_hybrid_settings)
+        self.memory_profile_combo.currentTextChanged.connect(
+            self._apply_memory_profile
+        )
+        self.performance_metrics_checkbox.stateChanged.connect(
+            lambda _state: settings_mgr.set_session_setting(
+                "performance_metrics_enabled",
+                self.performance_metrics_checkbox.isChecked(),
+            )
+        )
+        for widget, signal_name in (
+            (self.matany_res_combo, "currentTextChanged"),
+            (self.overlap_combo, "currentTextChanged"),
+            (self.chunk_combo, "currentTextChanged"),
+            (self.vitmatte_margin_spin, "valueChanged"),
+            (self.vitmatte_tile_spin, "valueChanged"),
+            (self.vitmatte_overlap_spin, "valueChanged"),
+            (self.mematte_margin_spin, "valueChanged"),
+            (self.mematte_tile_spin, "valueChanged"),
+            (self.mematte_overlap_spin, "valueChanged"),
+            (self.mematte_tokens_spin, "valueChanged"),
+            (self.mematte_precision_combo, "currentTextChanged"),
+            (self.hybrid_flow_resolution_combo, "currentTextChanged"),
+        ):
+            getattr(widget, signal_name).connect(self._mark_memory_profile_custom)
 
+        memory_layout.addWidget(memory_label)
+        memory_layout.addWidget(self.memory_profile_combo)
+        memory_layout.addStretch()
         model_layout.addWidget(model_label)
         model_layout.addWidget(self.matany_model_combo)
         model_layout.addStretch()
@@ -565,13 +888,18 @@ class MattingTab(QWidget):
         chunk_layout.addWidget(self.chunk_combo)
         chunk_layout.addStretch()
         
+        processing_layout.addLayout(memory_layout)
+        processing_layout.addWidget(self.performance_metrics_checkbox)
         processing_layout.addLayout(model_layout)
         processing_layout.addLayout(res_layout)
         processing_layout.addLayout(overlap_layout)
         processing_layout.addLayout(chunk_layout)
         processing_layout.addWidget(self.combined_mask_checkbox)
         processing_layout.addLayout(trimap_layout)
-        layout.addWidget(processing_group)
+        layout.addWidget(self.processing_group)
+
+        if memory_profile != CUSTOM_MEMORY_PROFILE:
+            self._apply_memory_profile(memory_profile)
 
         # Parameters
         self._create_parameter_sliders(layout)
@@ -705,7 +1033,11 @@ class MattingTab(QWidget):
         settings_mgr.set_session_setting("matany_model", value)
 
         # Show overlap and chunk size only for VideoMaMa
-        if value == "VideoMaMa":
+        uses_videomama = value == "VideoMaMa" or (
+            value == "Hybrid HQ"
+            and self.hybrid_temporal_combo.currentText() == "VideoMaMa"
+        )
+        if uses_videomama:
             self.overlap_label.setVisible(True)
             self.overlap_combo.setVisible(True)
             self.chunk_label.setVisible(True)
@@ -722,19 +1054,154 @@ class MattingTab(QWidget):
         self.vitmatte_tile_spin.setVisible(is_vitmatte)
         self.vitmatte_overlap_label.setVisible(is_vitmatte)
         self.vitmatte_overlap_spin.setVisible(is_vitmatte)
+        is_mematte = value in {"MEMatte", "Hybrid HQ"}
+        self.mematte_margin_label.setVisible(is_mematte)
+        self.mematte_margin_spin.setVisible(is_mematte)
+        self.mematte_tile_label.setVisible(is_mematte)
+        self.mematte_tile_spin.setVisible(is_mematte)
+        self.mematte_overlap_label.setVisible(is_mematte)
+        self.mematte_overlap_spin.setVisible(is_mematte)
+        self.mematte_tokens_label.setVisible(is_mematte)
+        self.mematte_tokens_spin.setVisible(is_mematte)
+        self.mematte_precision_label.setVisible(is_mematte)
+        self.mematte_precision_combo.setVisible(is_mematte)
+        is_hybrid = value == "Hybrid HQ"
+        self.hybrid_temporal_label.setVisible(is_hybrid)
+        self.hybrid_temporal_combo.setVisible(is_hybrid)
+        self.hybrid_stability_label.setVisible(is_hybrid)
+        self.hybrid_stability_combo.setVisible(is_hybrid)
+        self.hybrid_motion_checkbox.setVisible(is_hybrid)
+        self.hybrid_flow_resolution_label.setVisible(is_hybrid)
+        self.hybrid_flow_resolution_combo.setVisible(is_hybrid)
+        self.hybrid_evaluation_checkbox.setVisible(is_hybrid)
+        self.hybrid_evaluation_label.setVisible(is_hybrid)
+        self.hybrid_evaluation_edit.setVisible(is_hybrid)
+        self.hybrid_edge_label.setVisible(is_hybrid)
+        self.hybrid_edge_spin.setVisible(is_hybrid)
+        self.hybrid_feather_label.setVisible(is_hybrid)
+        self.hybrid_feather_spin.setVisible(is_hybrid)
+
+    def _save_hybrid_settings(self, _value=None):
+        settings_mgr = get_settings_manager()
+        settings_mgr.set_session_setting(
+            "hybrid_temporal_model", self.hybrid_temporal_combo.currentText()
+        )
+        settings_mgr.set_session_setting(
+            "hybrid_stability_preset", self.hybrid_stability_combo.currentText()
+        )
+        settings_mgr.set_session_setting(
+            "hybrid_motion_enabled", self.hybrid_motion_checkbox.isChecked()
+        )
+        settings_mgr.set_session_setting(
+            "hybrid_flow_resolution",
+            int(self.hybrid_flow_resolution_combo.currentText()),
+        )
+        self.hybrid_flow_resolution_combo.setEnabled(
+            self.hybrid_motion_checkbox.isChecked()
+        )
+        settings_mgr.set_session_setting(
+            "hybrid_evaluation_enabled",
+            self.hybrid_evaluation_checkbox.isChecked(),
+        )
+        settings_mgr.set_session_setting(
+            "hybrid_evaluation_label", self.hybrid_evaluation_edit.text().strip()
+        )
+        self.hybrid_evaluation_edit.setEnabled(
+            self.hybrid_evaluation_checkbox.isChecked()
+        )
+        settings_mgr.set_session_setting(
+            "hybrid_edge_width", self.hybrid_edge_spin.value()
+        )
+        settings_mgr.set_session_setting(
+            "hybrid_edge_feather", self.hybrid_feather_spin.value()
+        )
+        if self.matany_model_combo.currentText() == "Hybrid HQ":
+            self._save_model_setting("Hybrid HQ")
+
+    def _apply_memory_profile(self, name):
+        settings_mgr = get_settings_manager()
+        if name == CUSTOM_MEMORY_PROFILE:
+            settings_mgr.set_session_setting(
+                "memory_profile", CUSTOM_MEMORY_PROFILE
+            )
+            return
+        profile = get_memory_profile(name)
+        if profile is None:
+            return
+        self._applying_memory_profile = True
+        try:
+            values = apply_memory_profile(settings_mgr, name)
+            resolution = values["matany_res"]
+            self.matany_res_combo.setCurrentText(
+                "Full" if resolution == 0 else str(resolution)
+            )
+            self.overlap_combo.setCurrentText(str(values["matany_overlap"]))
+            self.chunk_combo.setCurrentText(str(values["matany_chunk"]))
+            self.vitmatte_margin_spin.setValue(values["vitmatte_roi_margin"])
+            self.vitmatte_tile_spin.setValue(values["vitmatte_tile_size"])
+            self.vitmatte_overlap_spin.setValue(
+                values["vitmatte_tile_overlap"]
+            )
+            self.mematte_margin_spin.setValue(values["mematte_roi_margin"])
+            self.mematte_tile_spin.setValue(values["mematte_tile_size"])
+            self.mematte_overlap_spin.setValue(
+                values["mematte_tile_overlap"]
+            )
+            self.mematte_tokens_spin.setValue(values["mematte_max_tokens"])
+            self.mematte_precision_combo.setCurrentText(
+                values["mematte_precision"]
+            )
+            self.hybrid_flow_resolution_combo.setCurrentText(
+                str(values["hybrid_flow_resolution"])
+            )
+        finally:
+            self._applying_memory_profile = False
+
+    def _mark_memory_profile_custom(self, _value=None):
+        if self._applying_memory_profile or self._loading_memory_settings:
+            return
+        settings_mgr = get_settings_manager()
+        settings_mgr.set_session_setting("memory_profile", CUSTOM_MEMORY_PROFILE)
+        self.memory_profile_combo.blockSignals(True)
+        self.memory_profile_combo.setCurrentText(CUSTOM_MEMORY_PROFILE)
+        self.memory_profile_combo.blockSignals(False)
 
     def _save_trimap_settings(self, _value=None):
         settings_mgr = get_settings_manager()
         automatic = self.trimap_auto_checkbox.isChecked()
         settings_mgr.set_session_setting("trimap_auto", automatic)
-        settings_mgr.set_session_setting("trimap_fg_erode", self.trimap_fg_spin.value())
-        settings_mgr.set_session_setting("trimap_bg_dilate", self.trimap_bg_spin.value())
-        settings_mgr.set_session_setting("vitmatte_roi_margin", self.vitmatte_margin_spin.value())
-        settings_mgr.set_session_setting("vitmatte_tile_size", self.vitmatte_tile_spin.value())
+        settings_mgr.set_session_setting(
+            "trimap_fg_erode", self.trimap_fg_spin.value()
+        )
+        settings_mgr.set_session_setting(
+            "trimap_bg_dilate", self.trimap_bg_spin.value()
+        )
+        settings_mgr.set_session_setting(
+            "vitmatte_roi_margin", self.vitmatte_margin_spin.value()
+        )
+        settings_mgr.set_session_setting(
+            "vitmatte_tile_size", self.vitmatte_tile_spin.value()
+        )
         overlap = min(
             self.vitmatte_overlap_spin.value(), self.vitmatte_tile_spin.value() - 1
         )
         settings_mgr.set_session_setting("vitmatte_tile_overlap", overlap)
+        settings_mgr.set_session_setting(
+            "mematte_roi_margin", self.mematte_margin_spin.value()
+        )
+        settings_mgr.set_session_setting(
+            "mematte_tile_size", self.mematte_tile_spin.value()
+        )
+        mematte_overlap = min(
+            self.mematte_overlap_spin.value(), self.mematte_tile_spin.value() - 1
+        )
+        settings_mgr.set_session_setting("mematte_tile_overlap", mematte_overlap)
+        settings_mgr.set_session_setting(
+            "mematte_max_tokens", self.mematte_tokens_spin.value()
+        )
+        settings_mgr.set_session_setting(
+            "mematte_precision", self.mematte_precision_combo.currentText()
+        )
         self.trimap_fg_spin.setEnabled(not automatic)
         self.trimap_bg_spin.setEnabled(not automatic)
 
@@ -755,33 +1222,13 @@ class MattingTab(QWidget):
     def load_values_from_settings(self):
         """Load all values from settings"""
         settings_mgr = get_settings_manager()
+        self._loading_memory_settings = True
         
         # Load model selection
         model = settings_mgr.get_session_setting("matany_model", "MatAnyone2")
-        if model == "MatAnyone2":
-            self.matany_model_combo.setCurrentIndex(1)
-            self.overlap_label.setVisible(False)
-            self.overlap_combo.setVisible(False)
-            self.chunk_label.setVisible(False)
-            self.chunk_combo.setVisible(False)
-        elif model == "MatAnyone":
-            self.matany_model_combo.setCurrentIndex(0)
-            self.overlap_label.setVisible(False)
-            self.overlap_combo.setVisible(False)
-            self.chunk_label.setVisible(False)
-            self.chunk_combo.setVisible(False)
-        elif model == "VideoMaMa":
-            self.matany_model_combo.setCurrentIndex(2)
-            self.overlap_label.setVisible(True) # overlap setting is visible for VideoMaMa
-            self.overlap_combo.setVisible(True)
-            self.chunk_label.setVisible(True) # chunk setting is visible for VideoMaMa
-            self.chunk_combo.setVisible(True)
-        else:
-            self.matany_model_combo.setCurrentText("ViTMatte")
-            self.overlap_label.setVisible(False)
-            self.overlap_combo.setVisible(False)
-            self.chunk_label.setVisible(False)
-            self.chunk_combo.setVisible(False)
+        if self.matany_model_combo.findText(model) < 0:
+            model = "ViTMatte"
+        self.matany_model_combo.setCurrentText(model)
 
         # Load overlap value
         overlap = settings_mgr.get_session_setting("matany_overlap", 2)
@@ -822,7 +1269,65 @@ class MattingTab(QWidget):
         self.vitmatte_overlap_spin.setValue(
             settings_mgr.get_session_setting("vitmatte_tile_overlap", 128)
         )
+        self.mematte_margin_spin.setValue(
+            settings_mgr.get_session_setting("mematte_roi_margin", 96)
+        )
+        self.mematte_tile_spin.setValue(
+            settings_mgr.get_session_setting("mematte_tile_size", 2048)
+        )
+        self.mematte_overlap_spin.setValue(
+            settings_mgr.get_session_setting("mematte_tile_overlap", 128)
+        )
+        self.mematte_tokens_spin.setValue(
+            settings_mgr.get_session_setting("mematte_max_tokens", 12000)
+        )
+        self.mematte_precision_combo.setCurrentText(
+            settings_mgr.get_session_setting("mematte_precision", "Float16")
+        )
+        self.hybrid_temporal_combo.setCurrentText(
+            settings_mgr.get_session_setting(
+                "hybrid_temporal_model", "MatAnyone2"
+            )
+        )
+        self.hybrid_stability_combo.setCurrentText(
+            settings_mgr.get_session_setting(
+                "hybrid_stability_preset", PRESERVE_TEMPORAL
+            )
+        )
+        self.hybrid_motion_checkbox.setChecked(
+            settings_mgr.get_session_setting("hybrid_motion_enabled", False)
+        )
+        self.hybrid_flow_resolution_combo.setCurrentText(
+            str(settings_mgr.get_session_setting("hybrid_flow_resolution", 720))
+        )
+        self.hybrid_evaluation_checkbox.setChecked(
+            settings_mgr.get_session_setting("hybrid_evaluation_enabled", False)
+        )
+        self.hybrid_evaluation_edit.setText(
+            settings_mgr.get_session_setting("hybrid_evaluation_label", "")
+        )
+        self.hybrid_edge_spin.setValue(
+            settings_mgr.get_session_setting("hybrid_edge_width", 12)
+        )
+        self.hybrid_feather_spin.setValue(
+            settings_mgr.get_session_setting("hybrid_edge_feather", 4)
+        )
+        self.performance_metrics_checkbox.setChecked(
+            settings_mgr.get_session_setting("performance_metrics_enabled", True)
+        )
+        memory_profile = settings_mgr.get_session_setting(
+            "memory_profile", CUSTOM_MEMORY_PROFILE
+        )
+        if memory_profile not in MEMORY_PROFILE_NAMES:
+            memory_profile = CUSTOM_MEMORY_PROFILE
+        self.memory_profile_combo.blockSignals(True)
+        self.memory_profile_combo.setCurrentText(memory_profile)
+        self.memory_profile_combo.blockSignals(False)
+        self._loading_memory_settings = False
+        if memory_profile != CUSTOM_MEMORY_PROFILE:
+            self._apply_memory_profile(memory_profile)
         self._save_trimap_settings()
+        self._save_hybrid_settings()
         self._save_model_setting(model)
 
         # Update gamma slider
@@ -1704,14 +2209,168 @@ class MainWindow(QMainWindow):
         self.frame_slider.setRange(0, 0)
         self.frame_slider.setValue(0)
         slider_layout.addWidget(self.frame_slider)
+
+        self.frame_display_label = QLabel("Display:")
+        self.frame_display_combo = QComboBox()
+        self.frame_display_combo.addItem(FRAME_INDEX_MODE)
+        self.frame_display_combo.setFixedHeight(26)
+        self.frame_display_combo.setMinimumWidth(110)
+        self.frame_display_default_tooltip = (
+            "Frame Index uses the internal zero-based index. Source Frame uses "
+            "the original image-sequence filename number. Metadata Timecode will "
+            "appear here when timecode metadata support is added."
+        )
+        self.frame_display_combo.setToolTip(self.frame_display_default_tooltip)
+        self.frame_display_label.setVisible(False)
+        self.frame_display_combo.setVisible(False)
+        slider_layout.addWidget(self.frame_display_label)
+        slider_layout.addWidget(self.frame_display_combo)
         
         self.frame_value = QLabel("0")
-        self.frame_value.setMinimumWidth(50)
+        self.frame_value.setMinimumWidth(72)
         self.frame_value.setAlignment(Qt.AlignCenter)
         slider_layout.addWidget(self.frame_value)
         
         self.frame_slider.valueChanged.connect(self.on_frame_change)
+        self.frame_display_combo.currentTextChanged.connect(
+            self._on_frame_display_mode_changed
+        )
         layout.addLayout(slider_layout)
+
+        self.in_out_range_label = QLabel()
+        self.in_out_range_label.setAlignment(Qt.AlignCenter)
+        self.in_out_range_label.setStyleSheet(
+            "QLabel { color: palette(mid); padding: 2px; }"
+        )
+        self.in_out_range_label.setVisible(False)
+        layout.addWidget(self.in_out_range_label)
+
+    def _frame_display_metadata(self):
+        return (
+            self.settings_mgr.get_session_setting("source_frame_numbers", []),
+            self.settings_mgr.get_session_setting("source_frame_padding", 0),
+            self.settings_mgr.get_session_setting("source_timecodes", []),
+        )
+
+    def _backfill_legacy_sequence_metadata(self):
+        """Recover source numbering for sessions saved before display metadata."""
+
+        total_frames = int(
+            self.settings_mgr.get_session_setting("total_frames", 0) or 0
+        )
+        source_numbers = self.settings_mgr.get_session_setting(
+            "source_frame_numbers", []
+        )
+        if total_frames <= 1 or len(source_numbers) == total_frames:
+            return False
+
+        source_path = self.settings_mgr.get_session_setting("video_file_path", "")
+        image_extensions = {
+            ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".gif", ".webp"
+        }
+        if Path(source_path).suffix.lower() not in image_extensions:
+            return False
+
+        recovered_numbers = []
+        recovered_padding = 0
+        inferred = True
+        if os.path.isfile(source_path):
+            is_sequence, sequence_files = sammie.detect_image_sequence(source_path)
+            if is_sequence and len(sequence_files) == total_frames:
+                recovered_numbers, recovered_padding = sequence_frame_metadata(
+                    sequence_files
+                )
+                inferred = False
+
+        if len(recovered_numbers) != total_frames:
+            recovered_numbers, recovered_padding = infer_contiguous_sequence_metadata(
+                source_path, total_frames
+            )
+            inferred = True
+        if len(recovered_numbers) != total_frames:
+            return False
+
+        self.settings_mgr.set_session_setting("media_type", "image_sequence")
+        self.settings_mgr.set_session_setting(
+            "source_frame_numbers", recovered_numbers
+        )
+        self.settings_mgr.set_session_setting(
+            "source_frame_padding", recovered_padding
+        )
+        self.settings_mgr.set_session_setting(
+            "source_frame_numbers_inferred", inferred
+        )
+        self.settings_mgr.save_session_settings()
+        return True
+
+    def _format_display_frame(self, frame_index):
+        source_numbers, source_padding, source_timecodes = (
+            self._frame_display_metadata()
+        )
+        return format_frame_value(
+            frame_index,
+            self.frame_display_combo.currentText(),
+            source_frame_numbers=source_numbers,
+            source_frame_padding=source_padding,
+            source_timecodes=source_timecodes,
+        )
+
+    def _update_frame_number_labels(self):
+        self.frame_value.setText(
+            self._format_display_frame(self.frame_slider.value())
+        )
+        marker_text = format_in_out_range(
+            self.frame_slider.get_in_point(),
+            self.frame_slider.get_out_point(),
+            self._format_display_frame,
+        )
+        self.in_out_range_label.setText(marker_text)
+        self.in_out_range_label.setVisible(bool(marker_text))
+
+    def _refresh_frame_display_controls(self):
+        self._backfill_legacy_sequence_metadata()
+        source_numbers, _source_padding, source_timecodes = (
+            self._frame_display_metadata()
+        )
+        modes = available_frame_display_modes(
+            core.VideoInfo.total_frames,
+            source_frame_numbers=source_numbers,
+            source_timecodes=source_timecodes,
+        )
+        requested_mode = self.settings_mgr.get_session_setting(
+            "frame_display_mode", FRAME_INDEX_MODE
+        )
+        active_mode = requested_mode if requested_mode in modes else FRAME_INDEX_MODE
+        self.frame_display_combo.blockSignals(True)
+        self.frame_display_combo.clear()
+        self.frame_display_combo.addItems(modes)
+        self.frame_display_combo.setCurrentText(active_mode)
+        self.frame_display_combo.blockSignals(False)
+        can_switch = len(modes) > 1
+        self.frame_display_label.setVisible(can_switch)
+        self.frame_display_combo.setVisible(can_switch)
+        if self.settings_mgr.get_session_setting(
+            "source_frame_numbers_inferred", False
+        ):
+            self.frame_display_combo.setToolTip(
+                "Source Frame was reconstructed as a contiguous sequence from "
+                "the selected filename because the original sequence is not "
+                "currently accessible. Reload the sequence for exact gap-aware "
+                "numbering."
+            )
+        else:
+            self.frame_display_combo.setToolTip(
+                self.frame_display_default_tooltip
+            )
+        self.settings_mgr.set_session_setting("frame_display_mode", active_mode)
+        self._update_frame_number_labels()
+
+    def _on_frame_display_mode_changed(self, mode):
+        if not mode:
+            return
+        self.settings_mgr.set_session_setting("frame_display_mode", mode)
+        self.settings_mgr.save_session_settings()
+        self._update_frame_number_labels()
     
     def _create_playback_controls(self, layout):
         """Create playback control buttons"""
@@ -1924,7 +2583,7 @@ class MainWindow(QMainWindow):
     
     def on_frame_change(self, value):
         """Handle frame slider changes"""
-        self.frame_value.setText(str(value))
+        self._update_frame_number_labels()
         current_frame = value
         
         # Update current_frame in point table and refresh if show_all_points is disabled
@@ -2371,10 +3030,13 @@ class MainWindow(QMainWindow):
         """Run object tracking using current points"""
         self.settings_mgr.save_session_settings()
         count = len(self.point_manager.points)
-        if count > 0:            
-            self.sam_manager.replay_points(self.point_manager.get_all_points())
-            if self.sam_manager.track_objects(parent_window=self) == 0: # if cancelled
-                self.sam_manager.replay_points(self.point_manager.get_all_points())
+        if count > 0:
+            all_points = self.point_manager.get_all_points()
+            self.sam_manager.replay_points(all_points)
+            if self.sam_manager.track_objects(
+                parent_window=self, points_list=all_points
+            ) == 0: # if cancelled or invalid
+                self.sam_manager.replay_points(all_points)
             else: # completed
                 pass
             sammie.remove_backup_mattes() # Make sure to remove an existing mattes backup folder
@@ -2503,10 +3165,31 @@ class MainWindow(QMainWindow):
         count = len(self.point_manager.points)
         matting_model = self.settings_mgr.get_session_setting("matany_model", "MatAnyone2")
         combined=self.settings_mgr.get_session_setting("matany_combined", False)
+        memory_profile = self.settings_mgr.get_session_setting(
+            "memory_profile", CUSTOM_MEMORY_PROFILE
+        )
+        print(
+            f"Matting memory profile: {memory_profile} "
+            "(large-model staged unload enforced)"
+        )
 
-        # Don't allow VideoMama on CPU
-        if core.DeviceManager.get_device().type == 'cpu' and matting_model == 'VideoMaMa':
-            show_message_dialog(self, title="Error" , message="VideoMaMa is not supported on CPU. Please use MatAnyone instead.", type="warning")
+        # Don't allow VideoMaMa directly or as a Hybrid HQ temporal stage on CPU.
+        hybrid_temporal = self.settings_mgr.get_session_setting(
+            "hybrid_temporal_model", "MatAnyone2"
+        )
+        uses_videomama = matting_model == "VideoMaMa" or (
+            matting_model == "Hybrid HQ" and hybrid_temporal == "VideoMaMa"
+        )
+        if core.DeviceManager.get_device().type == 'cpu' and uses_videomama:
+            show_message_dialog(
+                self,
+                title="Error",
+                message=(
+                    "VideoMaMa is not supported on CPU. Select MatAnyone2 as "
+                    "the Hybrid HQ temporal base."
+                ),
+                type="warning",
+            )
             return
 
         if count > 0:  
@@ -2725,6 +3408,7 @@ class MainWindow(QMainWindow):
         self.frame_slider.set_in_point(self.frame_slider.value())
         self.settings_mgr.set_session_setting("in_point", self.frame_slider.value())
         self.settings_mgr.save_session_settings()
+        self._update_frame_number_labels()
     
     def set_out_marker(self):
         """Set the out marker to the current frame"""
@@ -2735,6 +3419,7 @@ class MainWindow(QMainWindow):
         self.frame_slider.set_out_point(self.frame_slider.value())
         self.settings_mgr.set_session_setting("out_point", self.frame_slider.value())
         self.settings_mgr.save_session_settings()
+        self._update_frame_number_labels()
 
     def clear_markers(self):
         """Clear the in and out markers"""
@@ -2742,6 +3427,7 @@ class MainWindow(QMainWindow):
         self.settings_mgr.set_session_setting("in_point", None)
         self.settings_mgr.set_session_setting("out_point", None)
         self.settings_mgr.save_session_settings()
+        self._update_frame_number_labels()
 
     def goto_first_frame(self):
         """Go to the first frame"""
@@ -2848,6 +3534,7 @@ class MainWindow(QMainWindow):
         self._create_shortcut("Ctrl+LMB/RMB", None, "Delete point under cursor", create_shortcut=False)
         self._create_shortcut("Backspace", self.zoom_100, "100% Zoom", create_shortcut=False)
         self._create_shortcut("Ctrl+Backspace", self.fit_to_screen, "Fit to Screen", create_shortcut=False)
+        self._create_shortcut("F", self.fit_to_screen, "Fit Viewer to Frame")
         self._create_shortcut("=", self.zoom_in, "Zoom In")
         self._create_shortcut("-", self.zoom_out, "Zoom Out")
         self._create_shortcut("Ctrl+Shift+R", self.reset_interface, "Reset Interface", create_shortcut=False)
@@ -2963,6 +3650,7 @@ class MainWindow(QMainWindow):
         # Reset UI
         self.frame_slider.setRange(0, 0)
         self.frame_slider.setValue(0)
+        self._refresh_frame_display_controls()
         self._reset_show_all_points_button_state()
         self.viewer.clear_image()
         self.sidebar.load_values_from_settings()
@@ -2977,6 +3665,17 @@ class MainWindow(QMainWindow):
                 framecount = sammie.load_image_sequence(file_path, parent_window=self)
             else:
                 framecount = sammie.load_video(file_path, parent_window=self)
+                if framecount and framecount > 0:
+                    self.settings_mgr.set_session_setting("media_type", "video")
+                    self.settings_mgr.set_session_setting("source_frame_numbers", [])
+                    self.settings_mgr.set_session_setting("source_frame_padding", 0)
+                    self.settings_mgr.set_session_setting(
+                        "source_frame_numbers_inferred", False
+                    )
+                    self.settings_mgr.set_session_setting("source_timecodes", [])
+                    self.settings_mgr.set_session_setting(
+                        "frame_display_mode", FRAME_INDEX_MODE
+                    )
                 
             if framecount and framecount > 0:
                 # Save video info to session
@@ -3005,6 +3704,7 @@ class MainWindow(QMainWindow):
                 
                 # Update frame slider range
                 self.frame_slider.setRange(0, framecount-1)
+                self._refresh_frame_display_controls()
                 
                 # Load and display the first frame - reset zoom for new video
                 current_frame = 0
@@ -3051,6 +3751,8 @@ class MainWindow(QMainWindow):
                 out_point = self.settings_mgr.get_session_setting("out_point")
                 self.frame_slider.set_in_point(in_point)
                 self.frame_slider.set_out_point(out_point)
+
+            self._refresh_frame_display_controls()
 
             # Load and display the first frame - reset zoom for resumed session
             current_frame = 0

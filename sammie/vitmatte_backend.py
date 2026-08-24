@@ -179,6 +179,44 @@ def integrate_unknown_alpha_float(
     return output
 
 
+def run_tiled_unknown_inference(
+    predictor,
+    rgb: np.ndarray,
+    trimap: np.ndarray,
+    margin: int = 64,
+    max_tile_size: int = 1024,
+    tile_overlap: int = 128,
+) -> np.ndarray:
+    """Run an image-matting predictor over feathered unknown-band tiles."""
+
+    rois = unknown_rois(trimap, margin)
+    if not rois:
+        return integrate_unknown_alpha_float(trimap, np.zeros_like(trimap))
+    tiles = [
+        tile
+        for roi in rois
+        for tile in split_roi(roi, max_tile_size, tile_overlap)
+    ]
+    accumulated = np.zeros(trimap.shape, dtype=np.float32)
+    weights = np.zeros(trimap.shape, dtype=np.float32)
+    feather = tile_overlap // 2
+    for tile in tiles:
+        rgb_crop = rgb[tile.slices]
+        trimap_crop = trimap[tile.slices]
+        prediction = predictor(rgb_crop, trimap_crop).astype(np.float32)
+        weight = _tile_weight(*trimap_crop.shape, feather)
+        unknown = (trimap_crop > 0) & (trimap_crop < 255)
+        target_alpha = accumulated[tile.slices]
+        target_weight = weights[tile.slices]
+        target_alpha[unknown] += prediction[unknown] * weight[unknown]
+        target_weight[unknown] += weight[unknown]
+
+    prediction = np.zeros(trimap.shape, dtype=np.float32)
+    valid = weights > 0
+    prediction[valid] = accumulated[valid] / weights[valid]
+    return integrate_unknown_alpha_float(trimap, prediction)
+
+
 class VitMatteBackend:
     """Hugging Face Transformers-backed ViTMatte inference adapter."""
 
@@ -262,32 +300,14 @@ class VitMatteBackend:
     ) -> np.ndarray:
         """High-precision multi-ROI result in the normalized 0..1 range."""
 
-        rois = unknown_rois(trimap, margin)
-        if not rois:
-            return integrate_unknown_alpha_float(trimap, np.zeros_like(trimap))
-        tiles = [
-            tile
-            for roi in rois
-            for tile in split_roi(roi, max_tile_size, tile_overlap)
-        ]
-        accumulated = np.zeros(trimap.shape, dtype=np.float32)
-        weights = np.zeros(trimap.shape, dtype=np.float32)
-        feather = tile_overlap // 2
-        for tile in tiles:
-            rgb_crop = rgb[tile.slices]
-            trimap_crop = trimap[tile.slices]
-            prediction = self.predict(rgb_crop, trimap_crop).astype(np.float32)
-            weight = _tile_weight(*trimap_crop.shape, feather)
-            unknown = (trimap_crop > 0) & (trimap_crop < 255)
-            target_alpha = accumulated[tile.slices]
-            target_weight = weights[tile.slices]
-            target_alpha[unknown] += prediction[unknown] * weight[unknown]
-            target_weight[unknown] += weight[unknown]
-
-        prediction = np.zeros(trimap.shape, dtype=np.float32)
-        valid = weights > 0
-        prediction[valid] = accumulated[valid] / weights[valid]
-        return integrate_unknown_alpha_float(trimap, prediction)
+        return run_tiled_unknown_inference(
+            self.predict,
+            rgb,
+            trimap,
+            margin=margin,
+            max_tile_size=max_tile_size,
+            tile_overlap=tile_overlap,
+        )
 
     def unload(self):
         self.model = None

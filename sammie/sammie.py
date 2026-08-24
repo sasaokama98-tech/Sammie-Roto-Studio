@@ -9,6 +9,7 @@ import zipfile
 import threading
 import queue
 import multiprocessing
+import gc
 import av
 from tqdm import tqdm
 from PySide6.QtGui import QPixmap, QImage
@@ -370,6 +371,8 @@ class SamManager:
 
         last_frame_idx = None
         cancelled = False
+        nonempty_mask_count = 0
+        nonempty_frame_indices = set()
 
         if self.sam31_backend is not None:
             propagation = self.sam31_backend.propagate(
@@ -392,6 +395,11 @@ class SamManager:
 
         for out_frame_idx, masks in propagation:
             self._save_masks(out_frame_idx, masks)
+            nonempty_mask_count += sum(
+                1 for _, mask in masks if np.asarray(mask).any()
+            )
+            if any(np.asarray(mask).any() for _, mask in masks):
+                nonempty_frame_indices.add(int(out_frame_idx))
             last_frame_idx = out_frame_idx
 
             if progress_dialog is not None:
@@ -416,9 +424,153 @@ class SamManager:
             else:
                 progress_dialog.setValue(100)
 
-        return last_frame_idx, cancelled
+        return (
+            last_frame_idx,
+            cancelled,
+            nonempty_mask_count,
+            nonempty_frame_indices,
+        )
 
-    def track_objects(self, parent_window):
+    @staticmethod
+    def _sam31_anchor_plan(points_list, in_point, out_point):
+        """Choose a deterministic endpoint anchor for SAM 3.1 propagation."""
+        anchor_frames = sorted(
+            {
+                int(point["frame"])
+                for point in points_list
+                if "frame" in point and in_point <= int(point["frame"]) <= out_point
+            }
+        )
+        if not anchor_frames:
+            raise ValueError(
+                "SAM 3.1 requires point anchors on the In or Out frame of the "
+                "processing range."
+            )
+
+        invalid_frames = [
+            frame for frame in anchor_frames if frame not in {in_point, out_point}
+        ]
+        if invalid_frames:
+            frames = ", ".join(str(frame) for frame in invalid_frames)
+            raise ValueError(
+                "SAM 3.1 Track Objects only supports point anchors on the In "
+                f"frame ({in_point}) or Out frame ({out_point}). Move points from "
+                f"frame(s): {frames}."
+            )
+        if len(anchor_frames) > 1:
+            raise ValueError(
+                "SAM 3.1 Track Objects supports one anchor edge at a time. Place "
+                "points on either the In frame or the Out frame, not both."
+            )
+
+        anchor_frame = anchor_frames[0]
+        reverse = anchor_frame == out_point and out_point != in_point
+        return anchor_frame, out_point - in_point, reverse
+
+    @staticmethod
+    def _has_sam31_propagation_coverage(
+        nonempty_frame_indices, anchor_frame, total_frames
+    ):
+        """Require a real propagated mask, not just the existing anchor mask."""
+        if total_frames <= 1:
+            return bool(nonempty_frame_indices)
+        return any(
+            int(frame_idx) != int(anchor_frame)
+            for frame_idx in nonempty_frame_indices
+        )
+
+    def _run_sam31_sam2_fallback(
+        self,
+        parent_window,
+        points_list,
+        anchor_frame,
+        max_frame_num_to_track,
+        reverse,
+    ):
+        """Propagate a SAM 3.1 anchor mask through the stable SAM2 Large path."""
+        if not ensure_models("Large", parent=parent_window):
+            return None
+
+        object_ids = sorted(
+            {
+                int(point["object_id"])
+                for point in points_list
+                if int(point.get("frame", -1)) == int(anchor_frame)
+                and "object_id" in point
+            }
+        )
+        anchor_masks = {}
+        for object_id in object_ids:
+            mask_path = os.path.join(
+                core.mask_dir, f"{anchor_frame:05d}", f"{object_id}.png"
+            )
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is not None and np.any(mask):
+                anchor_masks[object_id] = mask > 0
+        if not anchor_masks:
+            print("SAM 3.1 fallback could not find a non-empty anchor mask")
+            return None
+
+        sam31_backend = self.sam31_backend
+        fallback_predictor = None
+        fallback_state = None
+        result = None
+        try:
+            print(
+                "SAM 3.1 native point propagation produced no masks beyond "
+                "the anchor; using the SAM 3.1 anchor mask with the stable "
+                "SAM2 Large propagation path."
+            )
+            sam31_backend.unload()
+            self.sam31_backend = None
+            self.predictor = None
+            self.inference_state = None
+            gc.collect()
+            core.DeviceManager.clear_cache()
+
+            device = core.DeviceManager.get_device()
+            fallback_predictor = build_sam2_video_predictor(
+                "./configs/sam2.1/sam2.1_hiera_l.yaml",
+                "./checkpoints/sam2.1_hiera_large.pt",
+                device=device,
+            )
+            fallback_state = fallback_predictor.init_state(
+                video_path=core.frames_dir,
+                async_loading_frames=True,
+                offload_video_to_cpu=True,
+            )
+            for object_id, mask in anchor_masks.items():
+                fallback_predictor.add_new_mask(
+                    inference_state=fallback_state,
+                    frame_idx=anchor_frame,
+                    obj_id=object_id,
+                    mask=mask,
+                )
+
+            self.predictor = fallback_predictor
+            self.inference_state = fallback_state
+            result = self._propagate(
+                parent_window,
+                start_frame_idx=anchor_frame,
+                max_frame_num_to_track=max_frame_num_to_track,
+                reverse=reverse,
+            )
+            return result
+        finally:
+            self.predictor = None
+            self.inference_state = None
+            fallback_predictor = None
+            fallback_state = None
+            gc.collect()
+            core.DeviceManager.clear_cache()
+
+            self.sam31_backend = sam31_backend
+            self.predictor = sam31_backend.load()
+            sam31_backend.start_session(core.frames_dir)
+            self.inference_state = {"session_id": sam31_backend.session_id}
+            self._replay_sam31_points(points_list, save_masks=False)
+
+    def track_objects(self, parent_window, points_list=None):
         """Track all objects across the full in/out point range (or the entire video)."""
         frame_count = core.VideoInfo.total_frames
         settings_mgr = get_settings_manager()
@@ -426,16 +578,88 @@ class SamManager:
         out_point = settings_mgr.get_session_setting("out_point", None)
         if in_point is None:
             in_point = 0
+        range_out_point = frame_count - 1 if out_point is None else out_point
         frames_to_track = None
-        total_frames = frame_count
+        total_frames = range_out_point - in_point + 1
         if out_point is not None:
             frames_to_track = out_point - in_point
-            total_frames = frames_to_track + 1
 
-        last_frame_idx, cancelled = self._propagate(
-            parent_window, start_frame_idx=in_point, max_frame_num_to_track=frames_to_track, reverse=False)
+        start_frame_idx = in_point
+        reverse = False
+        if self.sam31_backend is not None:
+            try:
+                start_frame_idx, frames_to_track, reverse = self._sam31_anchor_plan(
+                    points_list or [], in_point, range_out_point
+                )
+            except ValueError as exc:
+                self.propagated = False
+                print(str(exc))
+                show_message_dialog(
+                    parent_window,
+                    title="SAM 3.1 Anchor Required",
+                    message=str(exc),
+                    type="warning",
+                )
+                return 0
+            direction = "backward" if reverse else "forward"
+            print(
+                f"SAM 3.1 tracking from {direction} anchor frame "
+                f"{start_frame_idx} across {in_point}-{range_out_point}"
+            )
+
+        (
+            last_frame_idx,
+            cancelled,
+            nonempty_mask_count,
+            nonempty_frame_indices,
+        ) = self._propagate(
+            parent_window,
+            start_frame_idx=start_frame_idx,
+            max_frame_num_to_track=frames_to_track,
+            reverse=reverse,
+        )
 
         if not cancelled:
+            if self.sam31_backend is not None and not self._has_sam31_propagation_coverage(
+                nonempty_frame_indices, start_frame_idx, total_frames
+            ):
+                fallback_result = self._run_sam31_sam2_fallback(
+                    parent_window,
+                    points_list or [],
+                    start_frame_idx,
+                    frames_to_track,
+                    reverse,
+                )
+                if fallback_result is not None:
+                    (
+                        last_frame_idx,
+                        cancelled,
+                        nonempty_mask_count,
+                        nonempty_frame_indices,
+                    ) = fallback_result
+
+            if cancelled:
+                self.propagated = False
+                print("Tracking cancelled")
+                return 0
+
+            if self.sam31_backend is not None and not self._has_sam31_propagation_coverage(
+                nonempty_frame_indices, start_frame_idx, total_frames
+            ):
+                self.propagated = False
+                message = (
+                    "SAM 3.1 tracking completed without producing masks beyond "
+                    "the anchor frame. Native and compatibility propagation both "
+                    "failed. Adjust the endpoint anchor points and try again."
+                )
+                print(message)
+                show_message_dialog(
+                    parent_window,
+                    title="SAM 3.1 Tracking Failed",
+                    message=message,
+                    type="warning",
+                )
+                return 0
             self.propagated = (total_frames == frame_count)
             print("Tracking completed")
             return 1
@@ -451,7 +675,7 @@ class SamManager:
         last_frame = out_point if out_point is not None else core.VideoInfo.total_frames - 1
         max_frame_num_to_track = max(last_frame - current_frame, 0)
 
-        last_frame_idx, cancelled = self._propagate(
+        last_frame_idx, cancelled, _, _ = self._propagate(
             parent_window, start_frame_idx=current_frame, max_frame_num_to_track=max_frame_num_to_track,
             reverse=False)
 
@@ -469,7 +693,7 @@ class SamManager:
             in_point = 0
         max_frame_num_to_track = max(current_frame - in_point, 0)
 
-        last_frame_idx, cancelled = self._propagate(
+        last_frame_idx, cancelled, _, _ = self._propagate(
             parent_window, start_frame_idx=current_frame, max_frame_num_to_track=max_frame_num_to_track,
             reverse=True)
 
@@ -486,7 +710,7 @@ class SamManager:
             print("Already at the last frame")
             return current_frame
 
-        last_frame_idx, _ = self._propagate(
+        last_frame_idx, _, _, _ = self._propagate(
             parent_window, start_frame_idx=current_frame, max_frame_num_to_track=1,
             reverse=False, show_progress=False)
 
@@ -498,7 +722,7 @@ class SamManager:
             print("Already at the first frame")
             return current_frame
 
-        last_frame_idx, _ = self._propagate(
+        last_frame_idx, _, _, _ = self._propagate(
             parent_window, start_frame_idx=current_frame, max_frame_num_to_track=1,
             reverse=True, show_progress=False)
 
@@ -981,8 +1205,7 @@ def remove_backup_mattes():
 
 def load_video(video_file, parent_window):
     """Load video and save frames as images using multi-threaded writers"""
-    if os.path.exists(core.temp_dir):
-        shutil.rmtree(core.temp_dir)
+    core.remove_tree(core.temp_dir)
     os.makedirs(core.frames_dir)
     os.makedirs(core.mask_dir)
     os.makedirs(core.trimap_dir)
@@ -1079,8 +1302,7 @@ def load_video(video_file, parent_window):
             save_q.put(None)
         for t in writers:
             t.join()
-        if os.path.exists(core.temp_dir):
-            shutil.rmtree(core.temp_dir)
+        core.remove_tree(core.temp_dir)
         progress_dialog.close()
         print("Operation cancelled by user.")
         return 0
@@ -1181,8 +1403,7 @@ def load_image_sequence(image_path, parent_window):
         else:
             return 0
 
-    if os.path.exists(core.temp_dir):
-        shutil.rmtree(core.temp_dir)
+    core.remove_tree(core.temp_dir)
     os.makedirs(core.frames_dir)
     os.makedirs(core.mask_dir)
     os.makedirs(core.trimap_dir)
@@ -1198,6 +1419,21 @@ def load_image_sequence(image_path, parent_window):
 
     settings_mgr = get_settings_manager()
     app_frame_format = settings_mgr.get_app_setting("frame_format", "png")
+    if len(files_to_load) > 1:
+        from sammie.frame_display import sequence_frame_metadata
+
+        source_numbers, source_padding = sequence_frame_metadata(files_to_load)
+        settings_mgr.set_session_setting("media_type", "image_sequence")
+        settings_mgr.set_session_setting("source_frame_numbers", source_numbers)
+        settings_mgr.set_session_setting("source_frame_padding", source_padding)
+        settings_mgr.set_session_setting("source_frame_numbers_inferred", False)
+    else:
+        settings_mgr.set_session_setting("media_type", "image")
+        settings_mgr.set_session_setting("source_frame_numbers", [])
+        settings_mgr.set_session_setting("source_frame_padding", 0)
+        settings_mgr.set_session_setting("source_frame_numbers_inferred", False)
+    settings_mgr.set_session_setting("source_timecodes", [])
+    settings_mgr.set_session_setting("frame_display_mode", "Frame Index")
 
     first_image = cv2.imread(files_to_load[0])
     if first_image is None:
@@ -1229,8 +1465,7 @@ def load_image_sequence(image_path, parent_window):
         QApplication.processEvents()
 
         if progress_dialog.wasCanceled():
-            if os.path.exists(core.temp_dir):
-                shutil.rmtree(core.temp_dir)
+            core.remove_tree(core.temp_dir)
             progress_dialog.close()
             return 0
 
@@ -1276,8 +1511,7 @@ def restore_video_info():
 
 
 def load_project(file_name, parent_window):
-    if os.path.exists(core.temp_dir):
-        shutil.rmtree(core.temp_dir)
+    core.remove_tree(core.temp_dir)
     os.makedirs(core.temp_dir, exist_ok=True)
     progress = None
 

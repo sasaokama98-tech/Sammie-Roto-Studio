@@ -7,9 +7,14 @@ pipeline remain backend-agnostic.
 
 from __future__ import annotations
 
+import ast
+import io
 import inspect
 import os
+import re
 import shutil
+import sys
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Iterable
 
@@ -19,6 +24,74 @@ import numpy as np
 
 class Sam31UnavailableError(RuntimeError):
     """Raised when the optional SAM 3.1 runtime cannot be loaded."""
+
+
+class _CheckpointKeyOutputFilter(io.TextIOBase):
+    """Suppress verbose non-strict key lists while preserving normal output."""
+
+    _KEY_LINE = re.compile(
+        r"^(Missing|Unexpected) keys(?: \((\d+)\))?:\s*(.*)$"
+    )
+
+    def __init__(self, target):
+        super().__init__()
+        self.target = target
+        self.buffer = ""
+        self.missing_count = 0
+        self.unexpected_count = 0
+        self.report_count = 0
+
+    @staticmethod
+    def _payload_count(payload: str) -> int:
+        value = payload.strip()
+        if value.endswith("..."):
+            value = value[:-3]
+        try:
+            parsed = ast.literal_eval(value)
+        except (SyntaxError, ValueError):
+            return 0
+        return len(parsed) if isinstance(parsed, (list, tuple)) else 0
+
+    def _process_line(self, line: str, newline: bool = True):
+        match = self._KEY_LINE.match(line.strip())
+        if match is None:
+            self.target.write(line + ("\n" if newline else ""))
+            return
+        kind, explicit_count, payload = match.groups()
+        count = int(explicit_count) if explicit_count else self._payload_count(payload)
+        if kind == "Missing":
+            self.missing_count += count
+        else:
+            self.unexpected_count += count
+        self.report_count += 1
+
+    def write(self, value):
+        if not isinstance(value, str):
+            value = str(value)
+        self.buffer += value
+        while "\n" in self.buffer:
+            line, self.buffer = self.buffer.split("\n", 1)
+            self._process_line(line)
+        return len(value)
+
+    def flush(self):
+        self.target.flush()
+
+    def finish(self):
+        if self.buffer:
+            self._process_line(self.buffer, newline=False)
+            self.buffer = ""
+        self.target.flush()
+
+    def summary(self) -> str | None:
+        if not self.report_count:
+            return None
+        return (
+            "SAM 3.1 checkpoint compatibility: "
+            f"{self.report_count} non-strict key lists suppressed "
+            "(set "
+            "SAM31_VERBOSE_CHECKPOINT_KEYS=1 to show them)."
+        )
 
 
 class Sam31Backend:
@@ -36,6 +109,7 @@ class Sam31Backend:
         self.predictor = None
         self.session_id: str | None = None
         self.resource_path: str | None = None
+        self.frame_size: tuple[int, int] | None = None
         self.sdpa_backend_mode: str | None = None
 
     def _resolve_checkpoint_path(self) -> Path | None:
@@ -87,7 +161,25 @@ class Sam31Backend:
             if checkpoint_path is not None:
                 builder_args["checkpoint_path"] = str(checkpoint_path)
                 print(f"Loading local SAM 3.1 checkpoint: {checkpoint_path}")
-            self.predictor = build_sam3_multiplex_video_predictor(**builder_args)
+            verbose_keys = os.environ.get(
+                "SAM31_VERBOSE_CHECKPOINT_KEYS", ""
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if verbose_keys:
+                self.predictor = build_sam3_multiplex_video_predictor(
+                    **builder_args
+                )
+            else:
+                output_filter = _CheckpointKeyOutputFilter(sys.stdout)
+                try:
+                    with redirect_stdout(output_filter):
+                        self.predictor = build_sam3_multiplex_video_predictor(
+                            **builder_args
+                        )
+                finally:
+                    output_filter.finish()
+                    summary = output_filter.summary()
+                    if summary:
+                        print(summary)
         except Exception as exc:
             if checkpoint_path is not None:
                 message = (
@@ -186,6 +278,7 @@ class Sam31Backend:
             raise RuntimeError("SAM 3.1 model is not loaded")
         self.close_session()
         self.resource_path = self._prepare_resource(frames_dir)
+        self.frame_size = self._read_frame_size(self.resource_path)
         request = {
             "type": "start_session",
             "resource_path": self.resource_path,
@@ -193,6 +286,52 @@ class Sam31Backend:
         }
         response = self._handle_start_session(request)
         self.session_id = response["session_id"]
+
+    @staticmethod
+    def _read_frame_size(resource_path: str) -> tuple[int, int]:
+        """Read the original UI coordinate space from the staged frame set."""
+
+        resource = Path(resource_path)
+        frame_paths = sorted(
+            path
+            for path in resource.iterdir()
+            if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png"}
+        )
+        if not frame_paths:
+            raise FileNotFoundError(f"No readable frames found in {resource}")
+        frame = cv2.imread(str(frame_paths[0]), cv2.IMREAD_COLOR)
+        if frame is None:
+            raise OSError(f"Failed to read SAM 3.1 frame dimensions: {frame_paths[0]}")
+        height, width = frame.shape[:2]
+        return width, height
+
+    @staticmethod
+    def normalize_points(points, frame_size: tuple[int, int]) -> np.ndarray:
+        """Map original-frame pixel coordinates to SAM 3.1 relative coordinates."""
+
+        coordinates = np.asarray(points, dtype=np.float32)
+        if coordinates.ndim == 1 and coordinates.size == 2:
+            coordinates = coordinates.reshape(1, 2)
+        if coordinates.ndim != 2 or coordinates.shape[1] != 2:
+            raise ValueError("SAM 3.1 points must have shape Nx2")
+        if not np.isfinite(coordinates).all():
+            raise ValueError("SAM 3.1 points must contain finite coordinates")
+
+        width, height = frame_size
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Invalid SAM 3.1 frame size: {frame_size}")
+        if (
+            (coordinates[:, 0] < 0).any()
+            or (coordinates[:, 0] > width).any()
+            or (coordinates[:, 1] < 0).any()
+            or (coordinates[:, 1] > height).any()
+        ):
+            raise ValueError(
+                f"SAM 3.1 point lies outside the {width}x{height} source frame"
+            )
+
+        scale = np.asarray([width, height], dtype=np.float32)
+        return np.clip(coordinates / scale, 0.0, 1.0)
 
     def _handle_start_session(self, request):
         """Bridge SAM3 predictor/model init_state signature differences."""
@@ -258,16 +397,22 @@ class Sam31Backend:
         labels,
         clear_old_points: bool = True,
     ) -> list[tuple[int, np.ndarray]]:
+        if self.frame_size is None:
+            raise RuntimeError("SAM 3.1 session frame size is not initialized")
+        normalized_points = self.normalize_points(points, self.frame_size)
+        point_labels = np.asarray(labels, dtype=np.int32)
+        if point_labels.ndim != 1 or len(point_labels) != len(normalized_points):
+            raise ValueError("SAM 3.1 point labels must match the point count")
         response = self.predictor.handle_request(
             {
                 "type": "add_prompt",
                 "session_id": self.session_id,
                 "frame_index": frame_number,
-                "points": np.asarray(points, dtype=np.float32),
-                "point_labels": np.asarray(labels, dtype=np.int32),
+                "points": normalized_points,
+                "point_labels": point_labels,
                 "obj_id": object_id,
                 "clear_old_points": clear_old_points,
-                "rel_coordinates": False,
+                "rel_coordinates": True,
             }
         )
         return self.masks_from_outputs(response["outputs"])
@@ -326,3 +471,4 @@ class Sam31Backend:
         if self.resource_path and os.path.basename(self.resource_path) == "sam31_frames":
             shutil.rmtree(self.resource_path, ignore_errors=True)
         self.resource_path = None
+        self.frame_size = None

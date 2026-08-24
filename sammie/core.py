@@ -2,6 +2,8 @@
 import cv2
 import os
 import numpy as np
+import shutil
+import stat
 import torch
 import warnings
 from sammie.settings_manager import get_settings_manager
@@ -17,6 +19,22 @@ trimap_dir = os.path.join(temp_dir, "trimaps")
 backup_dir = os.path.join(temp_dir, "masks_backup")
 matting_dir = os.path.join(temp_dir, "matting")
 removal_dir = os.path.join(temp_dir, "removal")
+
+
+def _remove_readonly_path(remove_func, path, exc_info):
+    """Retry removal after clearing a Windows read-only attribute."""
+    error = exc_info[1]
+    if not isinstance(error, PermissionError):
+        raise error
+
+    os.chmod(path, os.stat(path).st_mode | stat.S_IWRITE)
+    remove_func(path)
+
+
+def remove_tree(path):
+    """Remove an application-owned directory, including read-only files."""
+    if os.path.exists(path):
+        shutil.rmtree(path, onerror=_remove_readonly_path)
 
 PALETTE = [
     (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128), (0, 128, 128),

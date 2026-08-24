@@ -1,4 +1,5 @@
 import os
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,7 +7,8 @@ from unittest.mock import patch
 
 import numpy as np
 
-from sammie.sam31_backend import Sam31Backend
+from sammie.sam31_backend import Sam31Backend, _CheckpointKeyOutputFilter
+from sammie.sammie import SamManager
 
 
 class _Device:
@@ -77,6 +79,7 @@ class Sam31BackendTests(unittest.TestCase):
         self.backend = Sam31Backend(_Device(), "png")
         self.backend.predictor = _FakePredictor()
         self.backend.session_id = "session"
+        self.backend.frame_size = (1920, 1080)
 
     def test_squeezes_singleton_mask_channel(self):
         outputs = {
@@ -111,20 +114,46 @@ class Sam31BackendTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, "checkpoint was not found"):
             backend._resolve_checkpoint_path()
 
-    def test_add_points_uses_absolute_coordinates(self):
+    def test_checkpoint_key_filter_compacts_verbose_non_strict_lists(self):
+        target = io.StringIO()
+        output = _CheckpointKeyOutputFilter(target)
+        output.write("ordinary builder message\n")
+        output.write("Missing keys: ['layer.a', 'layer.b', 'layer.c']\n")
+        output.write("Unexpected keys (12): ['tracker.a', 'tracker.b']...\n")
+        output.finish()
+
+        self.assertEqual(target.getvalue(), "ordinary builder message\n")
+        self.assertEqual(output.missing_count, 3)
+        self.assertEqual(output.unexpected_count, 12)
+        self.assertIn("2 non-strict key lists suppressed", output.summary())
+        self.assertNotIn("tracker.a", output.summary())
+
+    def test_add_points_normalizes_non_square_source_coordinates(self):
         masks = self.backend.add_points(
             frame_number=2,
             object_id=7,
-            points=[[10, 20]],
+            points=[[960, 270]],
             labels=[1],
         )
 
         request = self.backend.predictor.requests[-1]
         self.assertEqual(request["type"], "add_prompt")
-        self.assertFalse(request["rel_coordinates"])
+        self.assertTrue(request["rel_coordinates"])
+        self.assertTrue(
+            np.allclose(request["points"], np.asarray([[0.5, 0.25]]))
+        )
         self.assertEqual(request["obj_id"], 7)
         self.assertEqual(masks[0][0], 7)
         self.assertEqual(masks[0][1].shape, (4, 5))
+
+    def test_add_points_rejects_coordinates_outside_source_frame(self):
+        with self.assertRaisesRegex(ValueError, "outside"):
+            self.backend.add_points(
+                frame_number=2,
+                object_id=7,
+                points=[[1921, 270]],
+                labels=[1],
+            )
 
     def test_propagation_direction_is_mapped(self):
         frames = list(self.backend.propagate(2, 4, reverse=True))
@@ -135,6 +164,47 @@ class Sam31BackendTests(unittest.TestCase):
         self.assertEqual(request["max_frame_num_to_track"], 4)
         self.assertEqual(frames[0][0], 3)
         self.assertEqual(frames[0][1][0][0], 7)
+
+    def test_first_frame_anchor_selects_forward_tracking(self):
+        plan = SamManager._sam31_anchor_plan(
+            [{"frame": 10, "object_id": 0}], 10, 20
+        )
+
+        self.assertEqual(plan, (10, 10, False))
+
+    def test_last_frame_anchor_selects_backward_tracking(self):
+        plan = SamManager._sam31_anchor_plan(
+            [{"frame": 20, "object_id": 0}], 10, 20
+        )
+
+        self.assertEqual(plan, (20, 10, True))
+
+    def test_middle_frame_anchor_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "only supports point anchors"):
+            SamManager._sam31_anchor_plan(
+                [{"frame": 15, "object_id": 0}], 10, 20
+            )
+
+    def test_both_endpoint_anchors_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "one anchor edge at a time"):
+            SamManager._sam31_anchor_plan(
+                [
+                    {"frame": 10, "object_id": 0},
+                    {"frame": 20, "object_id": 0},
+                ],
+                10,
+                20,
+            )
+
+    def test_anchor_only_output_is_not_valid_propagation_coverage(self):
+        self.assertFalse(
+            SamManager._has_sam31_propagation_coverage({10}, 10, 11)
+        )
+
+    def test_non_anchor_output_is_valid_propagation_coverage(self):
+        self.assertTrue(
+            SamManager._has_sam31_propagation_coverage({10, 11}, 10, 11)
+        )
 
     def test_reset_and_remove_use_session_api(self):
         self.backend.reset()

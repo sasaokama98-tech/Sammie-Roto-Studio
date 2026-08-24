@@ -15,6 +15,33 @@ Sammie Roto Studio is an independently maintained downstream extension of [Sammi
 
 The upstream copyright and the [GNU General Public License v3.0](LICENSE) remain in effect. Studio-specific changes and support requests should be reported to this repository so that the official upstream project is not burdened with issues that only affect this extension.
 
+## Optional MEMatte backend
+
+The high-resolution MEMatte backend loads a user-supplied checkout of the
+[official MEMatte repository](https://github.com/linyiheng123/MEMatte) and an
+official ViTS checkpoint. Source, checkpoint, memory controls, and current
+license limitations are documented in
+[`docs/PHASE3_MEMATTE.md`](docs/PHASE3_MEMATTE.md). MEMatte source and weights
+are not redistributed with Sammie Roto Studio. Install its Python runtime with
+`uv sync --extra <compute-backend> --extra mematte`.
+
+## Hybrid HQ
+
+Hybrid HQ runs MatAnyone2 or VideoMaMa as a temporal stage, unloads it, then
+uses MEMatte only for uncertain edge ROIs. The stable core/background is
+preserved rather than replacing the full alpha. Phase 4.1 adds Preserve
+Temporal, Balanced, and Maximum Detail stability presets; Preserve Temporal is
+the default and filters only bounded MEMatte residuals across three frames.
+An optional Phase 4.2 Motion Confidence mode adds bidirectional DIS alignment
+with per-pixel forward/backward fallback; it remains experimental and off by
+default. Phase 4.3 can archive named temporal/final/confidence runs and write
+no-reference boundary and flow-warped comparison metrics plus a summary CSV.
+Controls and processing semantics are documented in
+[`docs/PHASE4_HYBRID_HQ.md`](docs/PHASE4_HYBRID_HQ.md).
+Memory Safe, Balanced, Fast, and automatically preserved Custom policies are
+documented in
+[`docs/PHASE5_MEMORY_PROFILES.md`](docs/PHASE5_MEMORY_PROFILES.md).
+
 **Please add a Github Star if you find it useful!**
 
 Sammie-Roto 2 is an easy-to-use, cross-platform desktop application for AI assisted masking of video clips. It has 3 primary functions:
