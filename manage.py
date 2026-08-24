@@ -3,9 +3,12 @@ import urllib.request
 
 # ===== CONFIG =====
 PYTHON_VERSION = "3.12"
-REPO_URL = "https://github.com/Zarxrax/Sammie-Roto-2.git"
-REPO_RAW_BASE = "https://raw.githubusercontent.com/Zarxrax/Sammie-Roto-2"
+APP_NAME = "Sammie Roto Studio"
+APP_SLUG = "Sammie-Roto-Studio"
+REPO_URL = "https://github.com/sasaokama98-tech/Sammie-Roto-Studio.git"
+REPO_RAW_BASE = "https://raw.githubusercontent.com/sasaokama98-tech/Sammie-Roto-Studio"
 DEFAULT_BRANCH = "main"
+STUDIO_EXTRAS = ("sam31", "vitmatte", "mematte")
 
 def get_uv_exe():
     """Absolute path to the uv executable this installer bootstrapped with."""
@@ -13,21 +16,24 @@ def get_uv_exe():
     exe_name = "uv.exe" if platform.system() == "Windows" else "uv"
     return os.path.join(app_dir, ".uv", exe_name)
 
+def get_uv_env():
+    """Environment for every uv subprocess manage.py invokes itself.
+    Clears VIRTUAL_ENV so uv's internal build-isolation environment
+    doesn't leak into child processes."""
+    env = os.environ.copy()
+    env.pop("VIRTUAL_ENV", None)
+    return env
+
 def cleanup_cache():
-    """After a successful install/update, prunes stale cache entries."""
-    run_command([get_uv_exe(), "cache", "prune", "--force"])
+    """After a successful install/reinstall/update, prunes the project cache."""
+    run_command([get_uv_exe(), "cache", "prune"])
 
 # ===== UTILS =====
 def run_command(cmd):
-    """Wrapper to handle uv commands.
-    Clears VIRTUAL_ENV from the environment before each call to prevent uv's
-    internal build isolation environment from leaking into child processes and
-    causing 'does not match project environment path' warnings."""
+    """Wrapper to handle uv commands."""
     print(">", " ".join(cmd))
-    env = os.environ.copy()
-    env.pop("VIRTUAL_ENV", None)
     try:
-        subprocess.check_call(cmd, env=env)
+        subprocess.check_call(cmd, env=get_uv_env())
     except subprocess.CalledProcessError as e:
         print(f"\nError executing command: {e}")
         sys.exit(1)
@@ -82,7 +88,7 @@ def get_installed_backend():
     try:
         result = subprocess.check_output(
             [get_uv_exe(), "pip", "show", "torch", "--python", ".venv"], 
-            text=True, stderr=subprocess.DEVNULL
+            text=True, stderr=subprocess.DEVNULL, env=get_uv_env()
         )
         version_line = next((l for l in result.splitlines() if l.startswith("Version:")), "").lower()
         for backend in ["cu130", "cu126", "rocm", "xpu", "cpu"]:
@@ -103,6 +109,18 @@ def init_git_tracking():
     from dulwich import porcelain
 
     if os.path.exists(".git"):
+        repo = Repo(".")
+        config = repo.get_config()
+        expected_url = REPO_URL.encode("utf-8")
+        try:
+            current_url = config.get((b"remote", b"origin"), b"url")
+        except KeyError:
+            porcelain.remote_add(repo, "origin", REPO_URL)
+            return
+        if current_url != expected_url:
+            print(f"[Pointing updater origin at {REPO_URL}]")
+            config.set((b"remote", b"origin"), b"url", expected_url)
+            config.write_to_path()
         return
 
     print("[Initializing Git tracking...]")
@@ -148,6 +166,8 @@ def sync_env(backend, reinstall=False):
     cmd = [get_uv_exe(), "sync", "--frozen"]
     if backend:
         cmd.extend(["--extra", backend])
+    for extra in STUDIO_EXTRAS:
+        cmd.extend(["--extra", extra])
     
     if reinstall:
         print(f"\n[Reinstalling dependencies for {backend or 'Default/MPS'}...]")
@@ -184,8 +204,8 @@ def perform_update(branch):
     pull_latest_code(branch)
     sync_env(resolve_backend())
     create_shortcuts()
-    cleanup_cache()
     print("\nUpdate complete!")
+    cleanup_cache()
 
 # ===== CORE ACTIONS =====
 def handle_update(branch):
@@ -200,8 +220,8 @@ def handle_update(branch):
         if recover != "n":
             pull_latest_code(branch)
             sync_env(resolve_backend("continue recovery"))
-            cleanup_cache()
             print("[Recovery complete!]")
+            cleanup_cache()
         else:
             print("[No changes made. Consider using Reinstall/Repair from the main menu.]")
         return
@@ -236,22 +256,22 @@ def setup(branch, reinstall=False):
 
     # -- Gather all choices upfront ----------------------------------------
 
-    # 1. Pull latest code?
+    # 1. Backend selection (with re-prompt on invalid input)
+    backend = choose_backend()
+
+    # 2. Pull latest code?
     if reinstall:
         prompt = (
-            "\nPull the latest code from GitHub? This will overwrite "
+            "\nAlso pull the latest code from GitHub? This will overwrite "
             "any local changes to program files. (y/N): "
         )
         pull_code = input(prompt).strip().lower() == "y"
     else:
         prompt = (
-            "\nPull the latest code from GitHub? Recommended if you're "
+            "\nPull the latest code from GitHub now? Recommended if you're "
             "not sure the downloaded files are the newest release. (Y/n): "
         )
         pull_code = input(prompt).strip().lower() != "n"
-
-    # 2. Backend selection (with re-prompt on invalid input)
-    backend = choose_backend()
 
     # 3. Model download -- fresh install only
     download_models_now = False
@@ -302,8 +322,8 @@ def setup(branch, reinstall=False):
         if os.path.exists(run_sh):
             os.chmod(run_sh, os.stat(run_sh).st_mode | 0o755)
 
-    cleanup_cache()
     print("\nSetup Complete!")
+    cleanup_cache()
 
     # Run the model downloader last so all dependencies are in place.
     if download_models_now:
@@ -316,7 +336,7 @@ def create_mac_app():
     """Creates a double-clickable .app bundle on macOS."""
 
     app_dir = os.path.abspath(os.path.dirname(__file__))
-    app_bundle = os.path.join(app_dir, "Sammie-Roto-2.app")
+    app_bundle = os.path.join(app_dir, f"{APP_SLUG}.app")
     macos_dir = os.path.join(app_bundle, "Contents", "MacOS")
     resources_dir = os.path.join(app_bundle, "Contents", "Resources")
     os.makedirs(macos_dir, exist_ok=True)
@@ -348,13 +368,13 @@ def create_mac_app():
             '<plist version="1.0">\n'
             '<dict>\n'
             '    <key>CFBundleName</key>\n'
-            '    <string>Sammie-Roto-2</string>\n'
+            f'    <string>{APP_NAME}</string>\n'
             '    <key>CFBundleIconFile</key>\n'
             '    <string>icon.icns</string>\n'
             '    <key>CFBundleExecutable</key>\n'
             '    <string>launcher</string>\n'
             '    <key>CFBundleIdentifier</key>\n'
-            '    <string>com.zarxrax.sammie-roto-2</string>\n'
+            '    <string>tech.sasaokama98.sammie-roto-studio</string>\n'
             '    <key>CFBundleVersion</key>\n'
             f'    <string>{version}</string>\n'
             '    <key>CFBundleShortVersionString</key>\n'
@@ -381,7 +401,7 @@ def create_mac_app():
     # actual .app bundle (which must stay next to run_sammie.sh).
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
     if os.path.isdir(desktop):
-        desktop_link = os.path.join(desktop, "Sammie-Roto-2.app")
+        desktop_link = os.path.join(desktop, f"{APP_SLUG}.app")
         try:
             if os.path.islink(desktop_link) or os.path.exists(desktop_link):
                 os.remove(desktop_link)
@@ -395,7 +415,7 @@ def create_mac_app():
     user_apps = os.path.join(os.path.expanduser("~"), "Applications")
     try:
         os.makedirs(user_apps, exist_ok=True)
-        apps_link = os.path.join(user_apps, "Sammie-Roto-2.app")
+        apps_link = os.path.join(user_apps, f"{APP_SLUG}.app")
         if os.path.islink(apps_link) or os.path.exists(apps_link):
             os.remove(apps_link)
         os.symlink(app_bundle, apps_link)
@@ -412,7 +432,7 @@ def create_linux_desktop_entry():
     apps_dir = os.path.join(home, ".local", "share", "applications")
     os.makedirs(apps_dir, exist_ok=True)
     
-    desktop_path = os.path.join(apps_dir, "sammie-roto-2.desktop")
+    desktop_path = os.path.join(apps_dir, "sammie-roto-studio.desktop")
     app_dir = os.path.abspath(os.path.dirname(__file__))
     icon_path = os.path.join(app_dir, "sammie", "resources", "icon.png")
     run_sh_path = os.path.join(app_dir, "run_sammie.sh")
@@ -420,13 +440,13 @@ def create_linux_desktop_entry():
     content = [
         "[Desktop Entry]",
         "Type=Application",
-        "Name=Sammie-Roto-2",
+        f"Name={APP_NAME}",
         "Comment=Video Rotoscoping and Masking Tool",
         f"Exec=\"{run_sh_path}\"",
         f"Icon={icon_path}",
         "Terminal=false",
         "Categories=Graphics;Video;VideoEditing;",
-        "StartupWMClass=Sammie-Roto-2",
+        f"StartupWMClass={APP_SLUG}",
     ]
 
     with open(desktop_path, "w") as f:
@@ -439,7 +459,7 @@ def create_windows_shortcut():
     """Creates a desktop shortcut on Windows."""
     app_dir = os.path.abspath(os.path.dirname(__file__))
     desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-    shortcut_path = os.path.join(desktop, "Sammie-Roto-2.lnk")
+    shortcut_path = os.path.join(desktop, f"{APP_NAME}.lnk")
     target = os.path.join(app_dir, "run_sammie.bat")
     icon = os.path.join(app_dir, "sammie", "resources", "icon.ico")
 
@@ -512,13 +532,13 @@ def main():
         return
 
     if is_app_running():
-        print("\n[Warning: Sammie-Roto-2 appears to be running.]")
+        print(f"\n[Warning: {APP_NAME} appears to be running.]")
         print("[Please close it before continuing to avoid corrupting your installation.]")
         confirm = input("Continue anyway? (y/N): ").strip().lower()
         if confirm != "y":
             sys.exit(0)
 
-    print("\nSammie-Roto-2 Manager")
+    print(f"\n{APP_NAME} Manager")
 
     actions = [("Check for Updates", lambda: handle_update(DEFAULT_BRANCH))]
     if dev_mode:
