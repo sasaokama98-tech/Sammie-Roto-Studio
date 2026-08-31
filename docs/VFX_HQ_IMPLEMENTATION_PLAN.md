@@ -204,6 +204,24 @@ See `PHASE5_MEMORY_PROFILES.md` for the exact profile matrix.
   row per run, including the active profile and core numerical settings.
 - Telemetry is optional and cannot fail or alter an otherwise successful matte.
 
+### Phase 5.2 — I/O reliability (implemented)
+
+- Media is decoded/copied into a sibling staging workspace and validated before
+  replacing the live `temp` session. Cancellation, unreadable frames,
+  inconsistent dimensions, missing indexes, or write failures leave the
+  previous session intact.
+- Loaded frame workspaces require exactly one readable frame for every internal
+  index in the detected sequence or decoded movie range.
+- PNG and EXR sequence export writes every requested frame atomically and
+  verifies the complete output range. Missing segmentation/matting masks become
+  zero-value frames/layers instead of sequence gaps.
+- Multilayer EXR uses a stable object-layer set across the complete sequence.
+- Video export rejects skipped renders, writes through a temporary container,
+  then decodes the completed file to verify its frame count before replacing an
+  existing output.
+- Sequence overwrite detection checks the complete requested range rather than
+  sampling only its first five frames.
+
 ## Validation matrix
 
 Use short, redistributable 2K and 4K sequences covering hair, beard, fur,

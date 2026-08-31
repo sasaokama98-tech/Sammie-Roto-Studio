@@ -1,5 +1,6 @@
 import sys
 import os
+import copy
 import subprocess
 import argparse
 import json
@@ -54,6 +55,14 @@ from sammie.media_input import (
     SUPPORTED_MEDIA_EXTENSIONS,
     discover_image_sequences,
     sequence_display_name,
+)
+from sammie.workspace_io import (
+    create_load_workspace,
+    discard_workspace,
+    finalize_workspace_swap,
+    rollback_workspace_swap,
+    swap_workspace,
+    validate_frame_workspace,
 )
 
 # Import GUI widgets
@@ -4129,11 +4138,10 @@ class MainWindow(QMainWindow):
         if file_name:  # Only proceed if a file was selected
             success = self.load_file(file_name)
             if not success:
-                print("Failed to load file or loading was cancelled.")
-                # Reset UI to empty state on failure
-                self.frame_slider.setRange(0, 0)
-                self.frame_slider.setValue(0)
-                self.viewer.clear_image()
+                print(
+                    "Failed to load file or loading was cancelled; "
+                    "the existing session was preserved."
+                )
     
     def handle_dropped_file(self, file_path):
         """Handle file dropped onto the viewer"""
@@ -4197,37 +4205,37 @@ class MainWindow(QMainWindow):
         self.load_file(file_path)
         
     def load_file(self, file_path, image_sequence_files=None):
-        """Load a file (consolidated method for both menu and command line usage)"""
-        # Clear all points and propagation data
-        self.point_manager.clear_all()
-        self.sam_manager.propagated = False
-        self.matany_manager.propagated = False
-
-        # Create new session
-        self.settings_mgr.create_new_session(file_path)
-        
-        # Reset UI
-        self.frame_slider.setRange(0, 0)
-        self.frame_slider.setValue(0)
-        self._refresh_frame_display_controls()
-        self._reset_show_all_points_button_state()
-        self.viewer.clear_image()
-        self.sidebar.load_values_from_settings()
-        self.sidebar.tab_widget.setCurrentIndex(0)
-        self.clear_markers()
-        self._update_dynamic_widgets()
-        
+        """Load media transactionally, preserving the current session on failure."""
         file_ext = os.path.splitext(file_path)[1].lower()
-        
+        session_snapshot = copy.deepcopy(self.settings_mgr.session_settings)
+        video_snapshot = {
+            "width": core.VideoInfo.width,
+            "height": core.VideoInfo.height,
+            "fps": core.VideoInfo.fps,
+            "total_frames": core.VideoInfo.total_frames,
+            "color_space": core.VideoInfo.color_space,
+        }
+        staging_workspace = None
+        backup_workspace = None
+        workspace_swapped = False
+
         try:
+            staging_workspace = create_load_workspace(core.temp_dir)
+            self.settings_mgr.create_new_session(file_path)
+
             if file_ext in IMAGE_EXTENSIONS:
                 framecount = sammie.load_image_sequence(
                     file_path,
                     parent_window=self,
                     sequence_files=image_sequence_files,
+                    workspace_dir=staging_workspace,
                 )
             else:
-                framecount = sammie.load_video(file_path, parent_window=self)
+                framecount = sammie.load_video(
+                    file_path,
+                    parent_window=self,
+                    workspace_dir=staging_workspace,
+                )
                 if framecount and framecount > 0:
                     self.settings_mgr.set_session_setting("media_type", "video")
                     self.settings_mgr.set_session_setting("source_frame_numbers", [])
@@ -4239,52 +4247,86 @@ class MainWindow(QMainWindow):
                     self.settings_mgr.set_session_setting(
                         "frame_display_mode", FRAME_INDEX_MODE
                     )
-                
-            if framecount and framecount > 0:
-                # Save video info to session
-                video_info = core.VideoInfo
-                self.settings_mgr.update_video_info(
-                    video_info.width, video_info.height, video_info.fps, video_info.total_frames, 
-                    video_info.color_space, file_path
-                )
-                
-                # If png or jpg was loaded, set the frame format to override the app setting
-                if file_ext in ['.png', '.jpg', '.jpeg']:
-                    frame_format = file_ext.lstrip('.')
-                    if frame_format == 'jpeg':
-                        frame_format = 'jpg'  # Normalize jpeg to jpg
-                    self.settings_mgr.set_session_setting("frame_format", frame_format)
-                    
-                self.settings_mgr.save_session_settings()
-                
-                print(f"Loaded {framecount} frames")
-                
-                # Initialize the predictor
-                self.sam_manager.initialize_predictor()
 
-                # Enable load model button
-                self.sidebar.segmentation_tab.sam_model_btn.setEnabled(True)
-                
-                # Update frame slider range
-                self.frame_slider.setRange(0, framecount-1)
-                self._refresh_frame_display_controls()
-                
-                # Load and display the first frame - reset zoom for new video
-                current_frame = 0
-                view_options = self.get_view_options()
-                updated_image = sammie.update_image(current_frame, view_options, self.point_manager.points)
-                if updated_image:
-                    self.viewer.load_image_reset_zoom(updated_image)  # Reset zoom for new content
-                    self.fit_to_screen()
-                self.frame_slider.setValue(0)
-                return True
-            else:
-                print(f"Failed to load file: {file_path}")
-                return False
-                
+            if not framecount:
+                raise InterruptedError("Media loading was cancelled")
+
+            validated = validate_frame_workspace(
+                staging_workspace, int(framecount)
+            )
+            if (
+                validated.width != core.VideoInfo.width
+                or validated.height != core.VideoInfo.height
+                or validated.frame_count != core.VideoInfo.total_frames
+            ):
+                raise RuntimeError(
+                    "Decoded media metadata does not match the staged frame sequence"
+                )
+
+            self.settings_mgr.set_session_setting(
+                "frame_format", validated.frame_format
+            )
+            self.settings_mgr.update_video_info(
+                validated.width,
+                validated.height,
+                core.VideoInfo.fps,
+                validated.frame_count,
+                core.VideoInfo.color_space,
+                file_path,
+            )
+
+            backup_workspace = swap_workspace(
+                staging_workspace, core.temp_dir
+            )
+            workspace_swapped = True
+            staging_workspace = None
+            if not self.settings_mgr.save_session_settings():
+                raise IOError("Failed to save the new media session settings")
+            finalize_workspace_swap(backup_workspace)
+            backup_workspace = None
         except Exception as e:
+            if workspace_swapped:
+                rollback_workspace_swap(core.temp_dir, backup_workspace)
+            else:
+                discard_workspace(staging_workspace)
+            self.settings_mgr.session_settings = session_snapshot
+            for key, value in video_snapshot.items():
+                setattr(core.VideoInfo, key, value)
             print(f"Error loading file {file_path}: {e}")
             return False
+
+        # Commit in-memory/UI state only after the new frame workspace and its
+        # session settings are durable.
+        self.point_manager.clear_all()
+        self.sam_manager.propagated = False
+        self.matany_manager.propagated = False
+        self.removal_manager.propagated = False
+
+        self.frame_slider.setRange(0, 0)
+        self.frame_slider.setValue(0)
+        self._refresh_frame_display_controls()
+        self._reset_show_all_points_button_state()
+        self.viewer.clear_image()
+        self.sidebar.load_values_from_settings()
+        self.sidebar.tab_widget.setCurrentIndex(0)
+        self.clear_markers()
+        self._update_dynamic_widgets()
+
+        print(f"Loaded {framecount} frames")
+        self.sam_manager.initialize_predictor()
+        self.sidebar.segmentation_tab.sam_model_btn.setEnabled(True)
+        self.frame_slider.setRange(0, framecount - 1)
+        self._refresh_frame_display_controls()
+
+        view_options = self.get_view_options()
+        updated_image = sammie.update_image(
+            0, view_options, self.point_manager.points
+        )
+        if updated_image:
+            self.viewer.load_image_reset_zoom(updated_image)
+            self.fit_to_screen()
+        self.frame_slider.setValue(0)
+        return True
 
     def resume_prev_session(self):
         """Resume previous session"""

@@ -24,6 +24,7 @@ from sammie.gui_widgets import show_message_dialog
 from sammie.model_downloader import ensure_models
 from sammie.sam31_backend import Sam31Backend, Sam31UnavailableError
 from sammie.trimap import TrimapConfig, generate_trimap, render_trimap_preview, save_trimap
+from sammie.workspace_io import workspace_paths
 
 smoothing_model = None  # global variable needed to avoid complexity of passing the model around
 
@@ -1009,7 +1010,10 @@ def _handle_segmentation_matte_view(frame_number, view_options, points, return_n
     """Handle Segmentation-Matte view"""
     mask = core.load_masks_for_frame(frame_number, points, return_combined=True, object_id_filter=object_id_filter)
     if mask is None:
-        return None
+        mask_3channel = np.zeros(
+            (core.VideoInfo.height, core.VideoInfo.width, 3), dtype=np.uint8
+        )
+        return mask_3channel if return_numpy else _convert_to_qpixmap(mask_3channel)
 
     mask = core.apply_mask_postprocessing(mask)
     mask_3channel = np.stack([mask] * 3, axis=-1)
@@ -1068,6 +1072,14 @@ def _handle_segmentation_alpha_view(frame_number, view_options, points, return_n
 
     mask = core.load_masks_for_frame(frame_number, points, return_combined=True, object_id_filter=object_id_filter)
     if mask is None:
+        image_rgba = cv2.merge(
+            [
+                image[:, :, 0],
+                image[:, :, 1],
+                image[:, :, 2],
+                np.zeros(image.shape[:2], dtype=np.uint8),
+            ]
+        )
         return _convert_to_qpixmap(image_rgba) if not return_numpy else image_rgba
 
     mask = core.apply_mask_postprocessing(mask)
@@ -1095,7 +1107,10 @@ def _handle_matting_matte_view(frame_number, view_options, points, return_numpy=
     mask = core.load_masks_for_frame(frame_number, points, return_combined=True,
                                 object_id_filter=object_id_filter, folder=core.matting_dir)
     if mask is None:
-        return None
+        mask_3channel = np.zeros(
+            (core.VideoInfo.height, core.VideoInfo.width, 3), dtype=np.uint8
+        )
+        return mask_3channel if return_numpy else _convert_to_qpixmap(mask_3channel)
 
     mask = core.apply_matany_postprocessing(mask)
     mask_3channel = np.stack([mask] * 3, axis=-1)
@@ -1139,6 +1154,14 @@ def _handle_matting_alpha_view(frame_number, view_options, points, return_numpy=
     mask = core.load_masks_for_frame(frame_number, points, return_combined=True,
                                 object_id_filter=object_id_filter, folder=core.matting_dir)
     if mask is None:
+        image_rgba = cv2.merge(
+            [
+                image[:, :, 0],
+                image[:, :, 1],
+                image[:, :, 2],
+                np.zeros(image.shape[:2], dtype=np.uint8),
+            ]
+        )
         return _convert_to_qpixmap(image_rgba) if not return_numpy else image_rgba
 
     mask = core.apply_matany_postprocessing(mask)
@@ -1191,7 +1214,7 @@ def _handle_object_removal_view(frame_number, view_options, points, return_numpy
 
     mask = core.load_masks_for_frame(frame_number, points, return_combined=True, object_id_filter=object_id_filter)
     if mask is None:
-        return None
+        return image if return_numpy else _convert_to_qpixmap(image)
 
     mask = core.apply_mask_postprocessing(mask)
 
@@ -1337,13 +1360,14 @@ def remove_backup_mattes():
 # Video / image I/O
 # .........................................................................................
 
-def load_video(video_file, parent_window):
+def load_video(video_file, parent_window, workspace_dir=None):
     """Load video and save frames as images using multi-threaded writers"""
-    core.remove_tree(core.temp_dir)
-    os.makedirs(core.frames_dir)
-    os.makedirs(core.mask_dir)
-    os.makedirs(core.trimap_dir)
-    os.makedirs(core.matting_dir)
+    workspace_root = workspace_dir or core.temp_dir
+    paths = workspace_paths(workspace_root)
+    if workspace_dir is None:
+        core.remove_tree(workspace_root)
+        for key in ("frames", "masks", "trimaps", "matting", "removal"):
+            os.makedirs(paths[key], exist_ok=True)
     print(f"Loading video: {video_file}")
 
     progress_dialog = QProgressDialog("Loading video...", "Cancel", 0, 100, parent_window)
@@ -1352,7 +1376,11 @@ def load_video(video_file, parent_window):
     progress_dialog.setAutoClose(True)
     progress_dialog.show()
 
-    container = av.open(video_file)
+    try:
+        container = av.open(video_file)
+    except Exception:
+        progress_dialog.close()
+        raise
     stream = container.streams.video[0]
 
     # Enable threading in the decoder itself for faster demuxing
@@ -1374,6 +1402,8 @@ def load_video(video_file, parent_window):
     # --- Threaded frame writing setup ---
     save_q = queue.Queue(maxsize=100)
     num_workers = max(2, multiprocessing.cpu_count() // 2)
+    write_errors = []
+    write_errors_lock = threading.Lock()
 
     def save_worker():
         while True:
@@ -1383,9 +1413,12 @@ def load_video(video_file, parent_window):
                 break
             path, frame = item
             try:
-                cv2.imwrite(path, frame)
+                if not cv2.imwrite(path, frame):
+                    raise IOError(f"OpenCV failed to write {path}")
             except Exception as e:
                 print(f"Error writing {path}: {e}")
+                with write_errors_lock:
+                    write_errors.append((path, str(e)))
             save_q.task_done()
 
     writers = []
@@ -1395,36 +1428,42 @@ def load_video(video_file, parent_window):
         writers.append(t)
 
     cancelled = False
+    decode_error = None
 
-    with tqdm(total=total_frames or None) as progress:
-        for frame in container.decode(stream):
-            frame_rgb = frame.reformat(
-                format="rgb24",
-                src_colorspace=src_cs,
-                dst_colorspace=1,   # always output BT.709
-                src_color_range=src_range,
-                dst_color_range=2,  # always output full range for PNG
-            ).to_ndarray()
+    try:
+        with tqdm(total=total_frames or None) as progress:
+            for frame in container.decode(stream):
+                frame_rgb = frame.reformat(
+                    format="rgb24",
+                    src_colorspace=src_cs,
+                    dst_colorspace=1,   # always output BT.709
+                    src_color_range=src_range,
+                    dst_color_range=2,  # always output full range for PNG
+                ).to_ndarray()
 
-            # cv2.imwrite expects BGR
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                frame_filename = os.path.join(
+                    paths["frames"], f"{frame_count:05d}.{frame_format}"
+                )
+                save_q.put((frame_filename, frame_bgr))
+                frame_count += 1
+                progress.update(1)
 
-            frame_filename = os.path.join(core.frames_dir, f"{frame_count:05d}.{frame_format}")
-            save_q.put((frame_filename, frame_bgr))
-            frame_count += 1
-            progress.update(1)
+                if total_frames:
+                    progress_dialog.setValue(
+                        min(100, frame_count * 100 // total_frames)
+                    )
+                QApplication.processEvents()
 
-            if total_frames:
-                progress_dialog.setValue(frame_count * 100 // total_frames)
-            QApplication.processEvents()
+                if progress_dialog.wasCanceled():
+                    cancelled = True
+                    break
+    except Exception as exc:
+        decode_error = exc
+    finally:
+        container.close()
 
-            if progress_dialog.wasCanceled():
-                cancelled = True
-                break
-
-    container.close()
-
-    if cancelled:
+    if cancelled or decode_error is not None:
         # Drain the queue without processing so workers can be shut down cleanly
         while not save_q.empty():
             try:
@@ -1436,8 +1475,10 @@ def load_video(video_file, parent_window):
             save_q.put(None)
         for t in writers:
             t.join()
-        core.remove_tree(core.temp_dir)
+        core.remove_tree(workspace_root)
         progress_dialog.close()
+        if decode_error is not None:
+            raise RuntimeError(f"Video decoding failed: {decode_error}") from decode_error
         print("Operation cancelled by user.")
         return 0
 
@@ -1446,6 +1487,15 @@ def load_video(video_file, parent_window):
         save_q.put(None)
     for t in writers:
         t.join()
+
+    if write_errors:
+        progress_dialog.close()
+        core.remove_tree(workspace_root)
+        first_path, first_error = write_errors[0]
+        raise IOError(
+            f"Failed to write {len(write_errors)} decoded frame(s); "
+            f"first: {first_path}: {first_error}"
+        )
 
     progress_dialog.setValue(100)
     progress_dialog.close()
@@ -1511,7 +1561,9 @@ def detect_image_sequence(image_path):
     return False, []
 
 
-def load_image_sequence(image_path, parent_window, sequence_files=None):
+def load_image_sequence(
+    image_path, parent_window, sequence_files=None, workspace_dir=None
+):
     """
     Load an image or image sequence. Detects sequences automatically and prompts
     the user unless an explicit folder-discovered sequence is supplied.
@@ -1545,11 +1597,12 @@ def load_image_sequence(image_path, parent_window, sequence_files=None):
         else:
             return 0
 
-    core.remove_tree(core.temp_dir)
-    os.makedirs(core.frames_dir)
-    os.makedirs(core.mask_dir)
-    os.makedirs(core.trimap_dir)
-    os.makedirs(core.matting_dir)
+    workspace_root = workspace_dir or core.temp_dir
+    paths = workspace_paths(workspace_root)
+    if workspace_dir is None:
+        core.remove_tree(workspace_root)
+        for key in ("frames", "masks", "trimaps", "matting", "removal"):
+            os.makedirs(paths[key], exist_ok=True)
 
     print(f"Loading {'image sequence' if len(files_to_load) > 1 else 'image'}: {len(files_to_load)} file(s)")
 
@@ -1584,34 +1637,59 @@ def load_image_sequence(image_path, parent_window, sequence_files=None):
                             message=f"Could not load image: {files_to_load[0]}", type="critical")
         return 0
 
-    core.VideoInfo.height, core.VideoInfo.width = first_image.shape[:2]
+    expected_height, expected_width = first_image.shape[:2]
+    core.VideoInfo.height, core.VideoInfo.width = expected_height, expected_width
     core.VideoInfo.fps = 24.0
-    core.VideoInfo.total_frames = len(files_to_load)
+    core.VideoInfo.total_frames = 0
 
     for frame_count, source_path in enumerate(files_to_load):
         image = cv2.imread(source_path)
         if image is None:
-            print(f"Warning: Could not load {source_path}, skipping...")
-            continue
+            progress_dialog.close()
+            raise RuntimeError(f"Could not read image frame: {source_path}")
+        if image.shape[:2] != (expected_height, expected_width):
+            progress_dialog.close()
+            raise RuntimeError(
+                f"Image frame has inconsistent dimensions: {source_path} "
+                f"is {image.shape[1]}x{image.shape[0]}, expected "
+                f"{expected_width}x{expected_height}"
+            )
 
         source_ext = os.path.splitext(source_path)[1].lower()
         if source_ext in ['.png', '.jpg', '.jpeg']:
             output_ext = source_ext.lstrip('.')
-            frame_filename = os.path.join(core.frames_dir, f"{frame_count:05d}.{output_ext}")
+            if output_ext == 'jpeg':
+                output_ext = 'jpg'
+            frame_filename = os.path.join(
+                paths["frames"], f"{frame_count:05d}.{output_ext}"
+            )
             shutil.copy2(source_path, frame_filename)
         else:
-            frame_filename = os.path.join(core.frames_dir, f"{frame_count:05d}.{app_frame_format}")
-            cv2.imwrite(frame_filename, image)
+            frame_filename = os.path.join(
+                paths["frames"], f"{frame_count:05d}.{app_frame_format}"
+            )
+            if not cv2.imwrite(frame_filename, image):
+                progress_dialog.close()
+                raise IOError(f"Failed to stage image frame: {source_path}")
+
+        staged_image = cv2.imread(frame_filename, cv2.IMREAD_UNCHANGED)
+        if staged_image is None:
+            progress_dialog.close()
+            raise RuntimeError(
+                f"Staged image frame is unreadable: {frame_filename}"
+            )
 
         progress_dialog.setValue((frame_count + 1) * 100 // len(files_to_load))
         QApplication.processEvents()
 
         if progress_dialog.wasCanceled():
-            core.remove_tree(core.temp_dir)
+            core.remove_tree(workspace_root)
             progress_dialog.close()
             return 0
 
     progress_dialog.setValue(100)
+    progress_dialog.close()
+    core.VideoInfo.total_frames = len(files_to_load)
     return core.VideoInfo.total_frames
 
 

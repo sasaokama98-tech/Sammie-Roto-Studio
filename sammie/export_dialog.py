@@ -669,8 +669,9 @@ class ExportDialog(QDialog):
             start_frame = 0
             end_frame = total_frames - 1
         
-        # Check the first few output numbers, not the internal source indexes.
-        frames_to_check = min(5, max(0, end_frame - start_frame + 1))
+        # Check the complete requested output range so later existing frames
+        # cannot be overwritten without confirmation.
+        frames_to_check = max(0, end_frame - start_frame + 1)
         for offset in range(frames_to_check):
             frame_num = settings.sequence_start_number + offset
             if self.current_format.format_id == 'exr':
@@ -685,7 +686,7 @@ class ExportDialog(QDialog):
     
     def _confirm_overwrite_sequence(self, existing_files: list, settings: ExportSettings) -> bool:
         """Confirm overwriting sequence files"""
-        files_text = "\n".join(existing_files)
+        files_text = "\n".join(existing_files[:5])
         
         # Calculate total frames
         total_frames = VideoInfo.total_frames
@@ -694,8 +695,8 @@ class ExportDialog(QDialog):
         else:
             frame_count = total_frames
         
-        if len(existing_files) == 5 and frame_count > 5:
-            files_text += f"\n... (and possibly {frame_count - 5} more)"
+        if len(existing_files) > 5:
+            files_text += f"\n... and {len(existing_files) - 5} more"
         
         reply = QMessageBox.question(
             self, "Files Exist",
