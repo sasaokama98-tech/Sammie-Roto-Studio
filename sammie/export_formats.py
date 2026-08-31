@@ -24,6 +24,7 @@ class ExportSettings:
     out_point: Optional[int]
     include_original: bool = False  # EXR only
     export_multiple: bool = False  # Video only
+    sequence_start_number: int = 0  # EXR/PNG output numbering
 
 
 class ExportFormat(ABC):

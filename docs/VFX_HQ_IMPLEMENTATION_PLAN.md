@@ -71,21 +71,21 @@ lines and emits one compatibility summary so the console remains readable.
 Set `SAM31_VERBOSE_CHECKPOINT_KEYS=1` before launch to restore the complete
 official diagnostic output when debugging a checkpoint mismatch.
 
-### SAM 3.1 follow-up — prompt selection mode
+### SAM 3.1 follow-up — prompt selection mode (implemented)
 
-Add a prompt-driven selection workflow only while `SAM 3.1` is selected:
+- Prompt controls appear only while `SAM 3.1` is selected; SAM2 and
+  EfficientTAM point workflows are unchanged.
+- Semantic `add_prompt` runs in an isolated preview session. One or more masks
+  can be previewed and selected without modifying the active point session.
+- Accepting candidates is restricted to the In or Out frame and explicitly
+  confirms before clearing existing points, masks, mattes, or removal results.
+- Accepted SAM candidate IDs are mapped to Studio object IDs. A stable positive
+  seed is placed inside each accepted mask so normal point refinement and
+  forward/backward tracking continue to work.
+- Prompt text, anchor frame, and candidate-to-object mappings are stored in
+  session/project settings and restored before point replay.
 
-1. Show a text prompt field and **Select by Prompt** action without changing
-   the point tools used by SAM2/EfficientTAM.
-2. Send the prompt through SAM 3.1's semantic `add_prompt` request and display
-   the returned candidates before committing them to Sammie object IDs.
-3. Let the user accept one or more candidates, then use the existing positive/
-   negative points for instance refinement and tracking.
-4. Treat a new semantic prompt as an explicit session reseed. The official
-   multiplex implementation resets semantic state when applying a text prompt,
-   so it must not silently erase existing point objects or masks.
-5. Preserve prompt text and candidate-to-object mappings in session settings so
-   replay and project reopening are deterministic.
+See `SAM31_PROMPT_SELECTION.md` for the workflow and persistence semantics.
 
 
 ## Phase 2 — ViTMatte image matting (complete)

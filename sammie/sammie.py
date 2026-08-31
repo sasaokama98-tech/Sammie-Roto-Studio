@@ -137,6 +137,20 @@ class SamManager:
         if self.sam31_backend is not None:
             self.sam31_backend.frame_extension = core.get_frame_extension().lower()
             self.sam31_backend.start_session(core.frames_dir)
+            settings_mgr = get_settings_manager()
+            self.sam31_backend.configure_prompt_seed(
+                {
+                    "text": settings_mgr.get_session_setting(
+                        "sam31_prompt_text", ""
+                    ),
+                    "frame": settings_mgr.get_session_setting(
+                        "sam31_prompt_frame", None
+                    ),
+                    "mappings": settings_mgr.get_session_setting(
+                        "sam31_prompt_mappings", []
+                    ),
+                }
+            )
             self.inference_state = {"session_id": self.sam31_backend.session_id}
             return
         self.inference_state = self.predictor.init_state(
@@ -358,6 +372,12 @@ class SamManager:
         self._notify('replay_complete')
 
     def _replay_sam31_points(self, points_list, save_masks=True):
+        object_ids = {
+            int(point["object_id"])
+            for point in points_list
+            if "object_id" in point
+        }
+        self.sam31_backend.retain_prompt_objects(object_ids)
         self.sam31_backend.reset()
         grouped = {}
         for point in points_list:
@@ -371,6 +391,40 @@ class SamManager:
             )
             if save_masks:
                 self._save_masks(frame_number, masks)
+
+    def preview_text_prompt(self, frame_number, text):
+        if self.sam31_backend is None:
+            raise RuntimeError("Prompt selection is available only with SAM 3.1")
+        return self.sam31_backend.preview_text_prompt(frame_number, text)
+
+    def discard_text_prompt_preview(self):
+        if self.sam31_backend is not None:
+            self.sam31_backend.discard_prompt_preview()
+
+    def commit_text_prompt(self, candidate_ids, studio_object_ids):
+        if self.sam31_backend is None:
+            raise RuntimeError("Prompt selection is available only with SAM 3.1")
+        for output_dir in (core.mask_dir, core.trimap_dir):
+            if os.path.exists(output_dir):
+                shutil.rmtree(output_dir)
+            os.makedirs(output_dir)
+        masks = self.sam31_backend.commit_prompt_candidates(
+            candidate_ids, studio_object_ids
+        )
+        frame_number = self.sam31_backend.prompt_seed["frame"]
+        self._save_masks(frame_number, masks)
+        self.propagated = False
+        self.deduplicated = False
+        return masks
+
+    def get_text_prompt_metadata(self):
+        if self.sam31_backend is None:
+            return None
+        return self.sam31_backend.prompt_seed_metadata()
+
+    def clear_text_prompt_seed(self):
+        if self.sam31_backend is not None:
+            self.sam31_backend.clear_prompt_seed()
 
     def _save_masks(self, frame_number, masks):
         """Persist normalized backend masks and their generated trimaps."""
@@ -1185,6 +1239,17 @@ def draw_removal_overlay(image, mask):
     alpha = mask.astype(np.float32) / 255.0
     return cv2.blendLinear(image, color_layer, 1.0 - (alpha * 0.5), alpha * 0.5)
 
+
+def _display_binary_mask(mask):
+    """Normalize a segmentation mask for OpenCV display operations."""
+    array = np.asarray(mask)
+    if array.ndim != 2:
+        raise ValueError(
+            f"Display masks must be 2D; received shape {array.shape}"
+        )
+    return np.ascontiguousarray((array > 0).astype(np.uint8) * 255)
+
+
 def draw_contours(image, processed_masks):
     """Draw colored contours on the current frame (expects preprocessed masks)"""
     if not processed_masks:
@@ -1194,7 +1259,9 @@ def draw_contours(image, processed_masks):
     kernel = np.ones((3, 3), np.uint8)
 
     for object_id, mask in processed_masks.items():
-        edges = cv2.morphologyEx(mask, cv2.MORPH_GRADIENT, kernel)
+        edges = cv2.morphologyEx(
+            _display_binary_mask(mask), cv2.MORPH_GRADIENT, kernel
+        )
         border_color = core.PALETTE[object_id % len(core.PALETTE)]
         overlay[edges > 0] = border_color
 
@@ -1230,14 +1297,17 @@ def apply_postprocessing_to_display(image, frame_number, points, view_options, o
 
     if raw_masks:
         processed_masks = {
-            object_id: core.apply_mask_postprocessing(mask) for object_id, mask in raw_masks.items()
+            object_id: core.apply_mask_postprocessing(_display_binary_mask(mask))
+            for object_id, mask in raw_masks.items()
         }
     else:
         processed_masks = {}
 
     # Substitute the preview mask for the selected object if provided
     if preview_mask is not None and preview_object_id is not None:
-        processed_masks[preview_object_id] = core.apply_mask_postprocessing(preview_mask)
+        processed_masks[preview_object_id] = core.apply_mask_postprocessing(
+            _display_binary_mask(preview_mask)
+        )
 
     if view_options.get("show_masks", True):
         image = draw_masks(image, processed_masks)
@@ -1441,17 +1511,25 @@ def detect_image_sequence(image_path):
     return False, []
 
 
-def load_image_sequence(image_path, parent_window):
+def load_image_sequence(image_path, parent_window, sequence_files=None):
     """
-    Load an image or image sequence. Detects sequences automatically and prompts user.
+    Load an image or image sequence. Detects sequences automatically and prompts
+    the user unless an explicit folder-discovered sequence is supplied.
     """
-    is_sequence, sequence_files = detect_image_sequence(image_path)
-    files_to_load = [image_path]
+    explicit_sequence = sequence_files is not None
+    if explicit_sequence:
+        files_to_load = list(sequence_files)
+        is_sequence = len(files_to_load) > 1
+        if not is_sequence:
+            files_to_load = [image_path]
+    else:
+        is_sequence, detected_files = detect_image_sequence(image_path)
+        files_to_load = [image_path]
 
-    if is_sequence:
+    if is_sequence and not explicit_sequence:
         msg_box = QMessageBox(parent_window)
         msg_box.setWindowTitle("Image Sequence Detected")
-        msg_box.setText(f"The selected image appears to be part of a sequence with {len(sequence_files)} images.")
+        msg_box.setText(f"The selected image appears to be part of a sequence with {len(detected_files)} images.")
         msg_box.setInformativeText("Would you like to load the entire sequence or just the single image?")
 
         sequence_button = msg_box.addButton("Load Sequence", QMessageBox.AcceptRole)
@@ -1461,7 +1539,7 @@ def load_image_sequence(image_path, parent_window):
         msg_box.exec()
 
         if msg_box.clickedButton() == sequence_button:
-            files_to_load = sequence_files
+            files_to_load = detected_files
         elif msg_box.clickedButton() == single_button:
             files_to_load = [image_path]
         else:

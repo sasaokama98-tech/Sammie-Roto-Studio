@@ -100,6 +100,7 @@ class ApplicationSettings:
     export_include_original: bool = False
     export_multiple: bool = False
     export_folder_path: str = ""
+    export_sequence_start_number: int = 0
 
 @dataclass  
 class SessionSettings:
@@ -135,6 +136,9 @@ class SessionSettings:
     
     # Segmentation parameters
     sam_model: str = "Base"
+    sam31_prompt_text: str = ""
+    sam31_prompt_frame: int = None
+    sam31_prompt_mappings: list = field(default_factory=list)
     holes: int = 0
     dots: int = 0
     border_fix: int = 0

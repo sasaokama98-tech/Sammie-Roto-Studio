@@ -274,6 +274,18 @@ class SequenceExportWorker(BaseExportWorker):
         super().__init__(settings, points, total_frames, parent_window)
         self.base_filename = base_filename
         self.format = FormatRegistry.get_format(settings.format_id)
+
+    def output_frame_number(self, source_frame_number: int) -> int:
+        """Map an internal source frame to the requested sequence numbering."""
+        return int(self.settings.sequence_start_number) + (
+            int(source_frame_number) - self.start_frame
+        )
+
+    def frame_filename(self, source_frame_number: int) -> str:
+        """Build the output filename for a source frame."""
+        output_number = self.output_frame_number(source_frame_number)
+        extension = self.format.file_extension.rsplit(".", 1)[-1]
+        return f"{self.base_filename}.{output_number:04d}.{extension}"
     
     def run(self):
         try:
@@ -315,7 +327,7 @@ class SequenceExportWorker(BaseExportWorker):
             
             self.status_updated.emit(f"Exporting frame {frame_num + 1}/{self.end_frame + 1}...")
             
-            frame_filename = f"{self.base_filename}.{frame_num:04d}.exr"
+            frame_filename = self.frame_filename(frame_num)
             frame_path = os.path.join(output_dir, frame_filename)
             
             try:
@@ -411,7 +423,7 @@ class SequenceExportWorker(BaseExportWorker):
             
             self.status_updated.emit(f"Exporting frame {frame_num + 1}/{self.end_frame + 1}...")
             
-            frame_filename = f"{self.base_filename}.{frame_num:04d}.png"
+            frame_filename = self.frame_filename(frame_num)
             frame_path = os.path.join(output_dir, frame_filename)
             
             try:

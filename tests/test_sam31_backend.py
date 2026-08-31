@@ -74,6 +74,54 @@ class _PredictorWithIncompatibleBaseSession:
         return {"session_id": "compatible-session"}
 
 
+class _PromptPredictor:
+    def __init__(self):
+        self.requests = []
+        self.session_count = 0
+
+    def handle_request(self, request):
+        self.requests.append(request)
+        request_type = request["type"]
+        if request_type == "start_session":
+            self.session_count += 1
+            return {"session_id": f"preview-{self.session_count}"}
+        if request_type == "add_prompt" and request.get("text"):
+            masks = np.zeros((2, 4, 5), dtype=bool)
+            masks[0, 0:2, 0:2] = True
+            masks[1, 1:4, 2:5] = True
+            return {
+                "frame_index": request["frame_index"],
+                "outputs": {
+                    "out_obj_ids": np.array([3, 7]),
+                    "out_binary_masks": masks,
+                    "out_probs": np.array([0.75, 0.95], dtype=np.float32),
+                    "out_boxes_xywh": np.array(
+                        [[0.0, 0.0, 0.4, 0.5], [0.4, 0.25, 0.6, 0.75]],
+                        dtype=np.float32,
+                    ),
+                },
+            }
+        if request_type == "add_prompt":
+            return {
+                "frame_index": request["frame_index"],
+                "outputs": {
+                    "out_obj_ids": np.array([request["obj_id"]]),
+                    "out_binary_masks": np.ones((1, 4, 5), dtype=bool),
+                },
+            }
+        return {"is_success": True}
+
+    def handle_stream_request(self, request):
+        self.requests.append(request)
+        yield {
+            "frame_index": 6,
+            "outputs": {
+                "out_obj_ids": np.array([7]),
+                "out_binary_masks": np.ones((1, 4, 5), dtype=bool),
+            },
+        }
+
+
 class Sam31BackendTests(unittest.TestCase):
     def setUp(self):
         self.backend = Sam31Backend(_Device(), "png")
@@ -230,6 +278,81 @@ class Sam31BackendTests(unittest.TestCase):
         self.assertEqual(predictor.model.init_kwargs["resource_path"], "frames")
         self.assertTrue(predictor.model.init_kwargs["offload_video_to_cpu"])
         self.assertTrue(predictor.model.init_kwargs["async_loading_frames"])
+
+    def test_prompt_preview_is_isolated_until_candidate_commit(self):
+        predictor = _PromptPredictor()
+        self.backend.predictor = predictor
+        self.backend.resource_path = "frames"
+
+        candidates = self.backend.preview_text_prompt(5, "person")
+
+        self.assertEqual(self.backend.session_id, "session")
+        self.assertEqual(self.backend.prompt_preview_session_id, "preview-1")
+        self.assertEqual([item["candidate_id"] for item in candidates], [3, 7])
+        self.assertAlmostEqual(candidates[1]["score"], 0.95, places=5)
+
+        masks = self.backend.commit_prompt_candidates([7], [2])
+
+        self.assertEqual(self.backend.session_id, "preview-1")
+        self.assertEqual(masks[0][0], 2)
+        self.assertEqual(self.backend.prompt_seed_metadata()["text"], "person")
+        self.assertEqual(
+            self.backend.prompt_seed_metadata()["mappings"][0]["object_id"], 2
+        )
+        close_requests = [
+            request for request in predictor.requests if request["type"] == "close_session"
+        ]
+        self.assertEqual(close_requests[-1]["session_id"], "session")
+        removed = [
+            request for request in predictor.requests if request["type"] == "remove_object"
+        ]
+        self.assertEqual(removed[-1]["obj_id"], 3)
+
+    def test_committed_candidate_maps_point_refinement_and_propagation(self):
+        predictor = _PromptPredictor()
+        self.backend.predictor = predictor
+        self.backend.resource_path = "frames"
+        self.backend.preview_text_prompt(5, "person")
+        self.backend.commit_prompt_candidates([7], [2])
+
+        masks = self.backend.add_points(5, 2, [[960, 540]], [1])
+        point_request = [
+            request
+            for request in predictor.requests
+            if request["type"] == "add_prompt" and request.get("points") is not None
+        ][-1]
+        propagated = list(self.backend.propagate(5, 1, reverse=False))
+
+        self.assertEqual(point_request["obj_id"], 7)
+        self.assertEqual(masks[0][0], 2)
+        self.assertEqual(propagated[0][1][0][0], 2)
+
+    def test_saved_prompt_seed_is_replayed_before_point_refinement(self):
+        predictor = _PromptPredictor()
+        self.backend.predictor = predictor
+        self.backend.configure_prompt_seed(
+            {
+                "text": "person",
+                "frame": 5,
+                "mappings": [
+                    {
+                        "candidate_index": 1,
+                        "candidate_id": 7,
+                        "object_id": 4,
+                        "score": 0.95,
+                    }
+                ],
+            }
+        )
+
+        masks = self.backend.add_points(5, 4, [[960, 540]], [1])
+        prompt_requests = [
+            request for request in predictor.requests if request["type"] == "add_prompt"
+        ]
+
+        self.assertEqual(prompt_requests[0]["text"], "person")
+        self.assertEqual(prompt_requests[1]["obj_id"], 7)
+        self.assertEqual(masks[0][0], 4)
 
 
 if __name__ == "__main__":

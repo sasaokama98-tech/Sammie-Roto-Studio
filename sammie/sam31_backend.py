@@ -111,6 +111,14 @@ class Sam31Backend:
         self.resource_path: str | None = None
         self.frame_size: tuple[int, int] | None = None
         self.sdpa_backend_mode: str | None = None
+        self.prompt_preview_session_id: str | None = None
+        self.prompt_preview_text: str = ""
+        self.prompt_preview_frame: int | None = None
+        self.prompt_candidates: list[dict] = []
+        self.prompt_seed: dict | None = None
+        self.prompt_seed_active = False
+        self.internal_to_studio: dict[int, int] = {}
+        self.studio_to_internal: dict[int, int] = {}
 
     def _resolve_checkpoint_path(self) -> Path | None:
         """Resolve an explicit, environment, or project-local checkpoint."""
@@ -276,6 +284,7 @@ class Sam31Backend:
     def start_session(self, frames_dir: str):
         if self.predictor is None:
             raise RuntimeError("SAM 3.1 model is not loaded")
+        self.discard_prompt_preview()
         self.close_session()
         self.resource_path = self._prepare_resource(frames_dir)
         self.frame_size = self._read_frame_size(self.resource_path)
@@ -286,6 +295,8 @@ class Sam31Backend:
         }
         response = self._handle_start_session(request)
         self.session_id = response["session_id"]
+        self.prompt_seed_active = False
+        self._reset_object_maps()
 
     @staticmethod
     def _read_frame_size(resource_path: str) -> tuple[int, int]:
@@ -389,6 +400,281 @@ class Sam31Backend:
             result.append((int(object_id), mask))
         return result
 
+    @staticmethod
+    def _candidates_from_outputs(outputs: dict) -> list[dict]:
+        masks = Sam31Backend.masks_from_outputs(outputs)
+        probabilities = np.asarray(outputs.get("out_probs", []), dtype=np.float32)
+        boxes = np.asarray(outputs.get("out_boxes_xywh", []), dtype=np.float32)
+        candidates = []
+        for index, (object_id, mask) in enumerate(masks):
+            score = float(probabilities[index]) if index < len(probabilities) else None
+            box = boxes[index].tolist() if index < len(boxes) else None
+            candidates.append(
+                {
+                    "candidate_index": index,
+                    "candidate_id": int(object_id),
+                    "score": score,
+                    "box_xywh": box,
+                    "area": int(np.count_nonzero(mask)),
+                    "mask": mask,
+                }
+            )
+        return candidates
+
+    def _close_session_id(self, session_id: str | None):
+        if self.predictor is None or session_id is None:
+            return
+        self.predictor.handle_request(
+            {
+                "type": "close_session",
+                "session_id": session_id,
+                "run_gc_collect": False,
+            }
+        )
+
+    def discard_prompt_preview(self):
+        preview_session_id = self.prompt_preview_session_id
+        self.prompt_preview_session_id = None
+        self.prompt_preview_text = ""
+        self.prompt_preview_frame = None
+        self.prompt_candidates = []
+        if preview_session_id is not None and preview_session_id != self.session_id:
+            self._close_session_id(preview_session_id)
+
+    def preview_text_prompt(self, frame_number: int, text: str) -> list[dict]:
+        """Evaluate a semantic prompt without mutating the active point session."""
+        if self.predictor is None or self.session_id is None or not self.resource_path:
+            raise RuntimeError("SAM 3.1 session is not initialized")
+        prompt = text.strip()
+        if not prompt:
+            raise ValueError("SAM 3.1 prompt text cannot be empty")
+
+        self.discard_prompt_preview()
+        response = self._handle_start_session(
+            {
+                "type": "start_session",
+                "resource_path": self.resource_path,
+                "offload_video_to_cpu": True,
+            }
+        )
+        preview_session_id = response["session_id"]
+        try:
+            response = self.predictor.handle_request(
+                {
+                    "type": "add_prompt",
+                    "session_id": preview_session_id,
+                    "frame_index": int(frame_number),
+                    "text": prompt,
+                }
+            )
+            candidates = self._candidates_from_outputs(response["outputs"])
+        except Exception:
+            self._close_session_id(preview_session_id)
+            raise
+
+        self.prompt_preview_session_id = preview_session_id
+        self.prompt_preview_text = prompt
+        self.prompt_preview_frame = int(frame_number)
+        self.prompt_candidates = candidates
+        return candidates
+
+    def _reset_object_maps(self):
+        self.internal_to_studio = {}
+        self.studio_to_internal = {}
+        if not self.prompt_seed:
+            return
+        for mapping in self.prompt_seed.get("mappings", []):
+            internal_id = int(mapping["candidate_id"])
+            studio_id = int(mapping["object_id"])
+            self.internal_to_studio[internal_id] = studio_id
+            self.studio_to_internal[studio_id] = internal_id
+
+    def configure_prompt_seed(self, seed: dict | None):
+        """Configure a committed semantic seed loaded from session metadata."""
+        if not seed or not seed.get("text") or seed.get("frame") is None:
+            self.prompt_seed = None
+        else:
+            mappings = [dict(mapping) for mapping in seed.get("mappings", [])]
+            self.prompt_seed = {
+                "text": str(seed["text"]),
+                "frame": int(seed["frame"]),
+                "mappings": mappings,
+            }
+        self.prompt_seed_active = False
+        self._reset_object_maps()
+
+    def prompt_seed_metadata(self) -> dict | None:
+        if not self.prompt_seed:
+            return None
+        return {
+            "text": self.prompt_seed["text"],
+            "frame": int(self.prompt_seed["frame"]),
+            "mappings": [dict(mapping) for mapping in self.prompt_seed["mappings"]],
+        }
+
+    def clear_prompt_seed(self):
+        self.discard_prompt_preview()
+        self.prompt_seed = None
+        self.prompt_seed_active = False
+        self.internal_to_studio = {}
+        self.studio_to_internal = {}
+
+    def _remove_internal_object(self, internal_id: int, frame_number: int):
+        return self.predictor.handle_request(
+            {
+                "type": "remove_object",
+                "session_id": self.session_id,
+                "frame_index": int(frame_number),
+                "obj_id": int(internal_id),
+            }
+        )
+
+    def commit_prompt_candidates(
+        self, candidate_ids: list[int], studio_object_ids: list[int]
+    ) -> list[tuple[int, np.ndarray]]:
+        """Adopt the isolated prompt session and map accepted candidates to Studio IDs."""
+        if self.prompt_preview_session_id is None:
+            raise RuntimeError("No SAM 3.1 prompt preview is available")
+        if not candidate_ids or len(candidate_ids) != len(studio_object_ids):
+            raise ValueError("Select at least one prompt candidate and matching object ID")
+        if len(set(candidate_ids)) != len(candidate_ids):
+            raise ValueError("Prompt candidates must be unique")
+        if len(set(studio_object_ids)) != len(studio_object_ids):
+            raise ValueError("Studio object IDs must be unique")
+
+        candidates_by_id = {
+            int(candidate["candidate_id"]): candidate
+            for candidate in self.prompt_candidates
+        }
+        missing = [candidate_id for candidate_id in candidate_ids if candidate_id not in candidates_by_id]
+        if missing:
+            raise ValueError(f"Unknown SAM 3.1 prompt candidate IDs: {missing}")
+
+        old_session_id = self.session_id
+        self.session_id = self.prompt_preview_session_id
+        self.prompt_preview_session_id = None
+        if old_session_id is not None and old_session_id != self.session_id:
+            self._close_session_id(old_session_id)
+
+        selected = set(int(candidate_id) for candidate_id in candidate_ids)
+        for candidate in self.prompt_candidates:
+            candidate_id = int(candidate["candidate_id"])
+            if candidate_id not in selected:
+                self._remove_internal_object(candidate_id, self.prompt_preview_frame or 0)
+
+        mappings = []
+        masks = []
+        for candidate_id, studio_id in zip(candidate_ids, studio_object_ids):
+            candidate = candidates_by_id[int(candidate_id)]
+            mappings.append(
+                {
+                    "candidate_index": int(candidate["candidate_index"]),
+                    "candidate_id": int(candidate_id),
+                    "object_id": int(studio_id),
+                    "score": candidate["score"],
+                }
+            )
+            masks.append((int(studio_id), candidate["mask"]))
+
+        self.prompt_seed = {
+            "text": self.prompt_preview_text,
+            "frame": int(self.prompt_preview_frame),
+            "mappings": mappings,
+        }
+        self.prompt_seed_active = True
+        self._reset_object_maps()
+        self.prompt_preview_text = ""
+        self.prompt_preview_frame = None
+        self.prompt_candidates = []
+        return masks
+
+    def _restore_prompt_seed(self) -> list[tuple[int, np.ndarray]]:
+        if not self.prompt_seed:
+            return []
+        response = self.predictor.handle_request(
+            {
+                "type": "add_prompt",
+                "session_id": self.session_id,
+                "frame_index": int(self.prompt_seed["frame"]),
+                "text": self.prompt_seed["text"],
+            }
+        )
+        candidates = self._candidates_from_outputs(response["outputs"])
+        by_id = {int(candidate["candidate_id"]): candidate for candidate in candidates}
+        selected_candidates = []
+        for mapping in self.prompt_seed["mappings"]:
+            candidate = by_id.get(int(mapping["candidate_id"]))
+            if candidate is None:
+                index = int(mapping.get("candidate_index", -1))
+                if index < 0 or index >= len(candidates):
+                    raise RuntimeError(
+                        "SAM 3.1 prompt candidates changed and the saved object mapping "
+                        "cannot be restored deterministically"
+                    )
+                candidate = candidates[index]
+                mapping["candidate_id"] = int(candidate["candidate_id"])
+            selected_candidates.append(candidate)
+
+        selected_ids = {int(candidate["candidate_id"]) for candidate in selected_candidates}
+        for candidate in candidates:
+            candidate_id = int(candidate["candidate_id"])
+            if candidate_id not in selected_ids:
+                self._remove_internal_object(candidate_id, int(self.prompt_seed["frame"]))
+
+        self.prompt_seed_active = True
+        self._reset_object_maps()
+        return [
+            (int(mapping["object_id"]), candidate["mask"])
+            for mapping, candidate in zip(self.prompt_seed["mappings"], selected_candidates)
+        ]
+
+    def ensure_prompt_seed(self):
+        if self.prompt_seed and not self.prompt_seed_active:
+            return self._restore_prompt_seed()
+        return []
+
+    def retain_prompt_objects(self, studio_object_ids: set[int]):
+        """Drop committed prompt mappings whose Studio object has no points."""
+        if not self.prompt_seed:
+            return
+        retained = []
+        for mapping in self.prompt_seed["mappings"]:
+            studio_id = int(mapping["object_id"])
+            if studio_id in studio_object_ids:
+                retained.append(mapping)
+            elif self.prompt_seed_active:
+                self._remove_internal_object(
+                    int(mapping["candidate_id"]), int(self.prompt_seed["frame"])
+                )
+        self.prompt_seed["mappings"] = retained
+        if not retained:
+            self.clear_prompt_seed()
+        else:
+            self._reset_object_maps()
+
+    def _internal_object_id(self, studio_object_id: int) -> int:
+        studio_object_id = int(studio_object_id)
+        if studio_object_id in self.studio_to_internal:
+            return self.studio_to_internal[studio_object_id]
+        used = set(self.internal_to_studio)
+        internal_id = studio_object_id
+        if internal_id in used:
+            internal_id = 0
+            while internal_id in used:
+                internal_id += 1
+        self.internal_to_studio[internal_id] = studio_object_id
+        self.studio_to_internal[studio_object_id] = internal_id
+        return internal_id
+
+    def _mapped_masks_from_outputs(self, outputs: dict) -> list[tuple[int, np.ndarray]]:
+        mapped = []
+        for internal_id, mask in self.masks_from_outputs(outputs):
+            if internal_id in self.internal_to_studio:
+                mapped.append((self.internal_to_studio[internal_id], mask))
+            elif not self.prompt_seed:
+                mapped.append((internal_id, mask))
+        return mapped
+
     def add_points(
         self,
         frame_number: int,
@@ -403,6 +689,8 @@ class Sam31Backend:
         point_labels = np.asarray(labels, dtype=np.int32)
         if point_labels.ndim != 1 or len(point_labels) != len(normalized_points):
             raise ValueError("SAM 3.1 point labels must match the point count")
+        self.ensure_prompt_seed()
+        internal_object_id = self._internal_object_id(object_id)
         response = self.predictor.handle_request(
             {
                 "type": "add_prompt",
@@ -410,12 +698,12 @@ class Sam31Backend:
                 "frame_index": frame_number,
                 "points": normalized_points,
                 "point_labels": point_labels,
-                "obj_id": object_id,
+                "obj_id": internal_object_id,
                 "clear_old_points": clear_old_points,
                 "rel_coordinates": True,
             }
         )
-        return self.masks_from_outputs(response["outputs"])
+        return self._mapped_masks_from_outputs(response["outputs"])
 
     def propagate(
         self,
@@ -423,6 +711,7 @@ class Sam31Backend:
         max_frame_num_to_track: int | None,
         reverse: bool,
     ) -> Iterable[tuple[int, list[tuple[int, np.ndarray]]]]:
+        self.ensure_prompt_seed()
         direction = "backward" if reverse else "forward"
         request = {
             "type": "propagate_in_video",
@@ -432,24 +721,31 @@ class Sam31Backend:
             "max_frame_num_to_track": max_frame_num_to_track,
         }
         for response in self.predictor.handle_stream_request(request):
-            yield response["frame_index"], self.masks_from_outputs(response["outputs"])
+            yield response["frame_index"], self._mapped_masks_from_outputs(response["outputs"])
 
     def reset(self):
         if self.predictor is not None and self.session_id is not None:
             self.predictor.handle_request(
                 {"type": "reset_session", "session_id": self.session_id}
             )
+        self.prompt_seed_active = False
+        self._reset_object_maps()
 
     def remove_object(self, object_id: int, frame_number: int = 0):
         if self.predictor is not None and self.session_id is not None:
-            return self.predictor.handle_request(
-                {
-                    "type": "remove_object",
-                    "session_id": self.session_id,
-                    "frame_index": frame_number,
-                    "obj_id": object_id,
-                }
-            )
+            internal_id = self.studio_to_internal.get(int(object_id), int(object_id))
+            response = self._remove_internal_object(internal_id, frame_number)
+            self.internal_to_studio.pop(internal_id, None)
+            self.studio_to_internal.pop(int(object_id), None)
+            if self.prompt_seed:
+                self.prompt_seed["mappings"] = [
+                    mapping
+                    for mapping in self.prompt_seed["mappings"]
+                    if int(mapping["object_id"]) != int(object_id)
+                ]
+                if not self.prompt_seed["mappings"]:
+                    self.clear_prompt_seed()
+            return response
         return None
 
     def close_session(self):
@@ -464,8 +760,10 @@ class Sam31Backend:
                 )
             finally:
                 self.session_id = None
+                self.prompt_seed_active = False
 
     def unload(self):
+        self.discard_prompt_preview()
         self.close_session()
         self.predictor = None
         if self.resource_path and os.path.basename(self.resource_path) == "sam31_frames":

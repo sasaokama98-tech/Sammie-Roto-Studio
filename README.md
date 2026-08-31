@@ -25,6 +25,15 @@ license limitations are documented in
 are not redistributed with Sammie Roto Studio. Install its Python runtime with
 `uv sync --extra <compute-backend> --extra mematte`.
 
+## SAM 3.1 prompt selection
+
+When SAM 3.1 is selected, Studio can preview semantic text-prompt candidates in
+an isolated, non-destructive model session. Accepted candidates become normal
+Studio objects that can be refined with positive/negative points and tracked
+forward from In or backward from Out. The prompt, anchor, and object mappings
+are retained in project settings. See
+[`docs/SAM31_PROMPT_SELECTION.md`](docs/SAM31_PROMPT_SELECTION.md).
+
 ## Hybrid HQ
 
 Hybrid HQ runs MatAnyone2 or VideoMaMa as a temporal stage, unloads it, then
@@ -44,7 +53,7 @@ documented in
 
 The integrated installer/updater follows this Studio repository and keeps the
 SAM 3.1, ViTMatte, and MEMatte runtime extras installed. Studio version
-`2.4.0+studio.1` incorporates the original Sammie-Roto 2 v2.4.0 installer,
+`2.4.0+studio.2` incorporates the original Sammie-Roto 2 v2.4.0 installer,
 device detection, image-loading, progress-feedback, segmentation-preview, and
 dependency-configuration updates without replacing the Studio backends or UI.
 

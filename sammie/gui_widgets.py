@@ -35,6 +35,7 @@ from PySide6.QtCore import (
 )
 
 from sammie import core
+from sammie.media_input import is_supported_drop_path
 from sammie.settings_manager import get_settings_manager
 
 # ==================== CONSOLE REDIRECT ====================
@@ -735,18 +736,10 @@ class ImageViewer(QGraphicsView):
     
     def dragEnterEvent(self, event):
         """Handle drag enter events"""
-        # Check if the dragged data contains URLs (files)
         if event.mimeData().hasUrls():
-            # Get the first URL
             urls = event.mimeData().urls()
             if urls:
-                file_path = urls[0].toLocalFile()
-                # Check if it's a supported file type
-                supported_extensions = [
-                    '.mp4', '.m4v', '.mkv', '.mov', '.avi', '.webm',
-                    '.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.gif', '.webp'
-                ]
-                if any(file_path.lower().endswith(ext) for ext in supported_extensions):
+                if is_supported_drop_path(urls[0].toLocalFile()):
                     event.acceptProposedAction()
                     return
         event.ignore()
@@ -754,9 +747,11 @@ class ImageViewer(QGraphicsView):
     def dragMoveEvent(self, event):
         """Handle drag move events"""
         if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-        else:
-            event.ignore()
+            urls = event.mimeData().urls()
+            if urls and is_supported_drop_path(urls[0].toLocalFile()):
+                event.acceptProposedAction()
+                return
+        event.ignore()
     
     def dropEvent(self, event):
         """Handle drop events"""
@@ -764,10 +759,11 @@ class ImageViewer(QGraphicsView):
             urls = event.mimeData().urls()
             if urls:
                 file_path = urls[0].toLocalFile()
-                # Emit signal to notify parent window
-                self.file_dropped.emit(file_path)
-                event.acceptProposedAction()
-                return
+                if is_supported_drop_path(file_path):
+                    # Emit signal to notify parent window
+                    self.file_dropped.emit(file_path)
+                    event.acceptProposedAction()
+                    return
         event.ignore()
 
     # ==================== EVENT HANDLERS ====================

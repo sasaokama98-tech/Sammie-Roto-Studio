@@ -5,6 +5,8 @@ import argparse
 import json
 import traceback
 import webbrowser
+import cv2
+import numpy as np
 from pathlib import Path
 from datetime import datetime
 from PySide6.QtWidgets import (
@@ -12,7 +14,8 @@ from PySide6.QtWidgets import (
     QGridLayout, QWidget, QPushButton, QLabel, QStatusBar, QSlider, 
     QTabWidget, QSpinBox, QComboBox, QSplitter, QGroupBox, QTextEdit,
     QCheckBox, QLineEdit, QMessageBox, QDialog, QProgressDialog,
-    QScrollArea, QSizePolicy
+    QScrollArea, QSizePolicy, QListWidget, QListWidgetItem, QAbstractItemView,
+    QInputDialog
 )
 from PySide6.QtGui import (
     QAction, QShortcut, QKeySequence, QTextCursor, QIcon, QPixmap, QFont, QDesktopServices
@@ -46,6 +49,12 @@ from sammie.frame_display import (
     infer_contiguous_sequence_metadata,
     sequence_frame_metadata,
 )
+from sammie.media_input import (
+    IMAGE_EXTENSIONS,
+    SUPPORTED_MEDIA_EXTENSIONS,
+    discover_image_sequences,
+    sequence_display_name,
+)
 
 # Import GUI widgets
 from sammie.gui_widgets import (
@@ -56,7 +65,7 @@ from sammie.gui_widgets import (
 
 # ==================== VERSION ====================
 
-__version__ = "2.4.0+studio.1"
+__version__ = "2.4.0+studio.2"
 
 # ==================== LOGGING HELPER ====================
 
@@ -104,6 +113,9 @@ class SegmentationTab(QWidget):
 
         # Model Selection group
         self._create_model_selection_group(layout)
+
+        # SAM 3.1 semantic prompt selection (hidden for other backends)
+        self._create_prompt_selection_group(layout)
         
         # Clear Points group
         self._create_clear_points_group(layout)
@@ -203,6 +215,122 @@ class SegmentationTab(QWidget):
         model_layout_row.addWidget(self.sam_model_btn)
         
         layout.addWidget(model_group)
+
+    def _create_prompt_selection_group(self, layout):
+        self.sam31_prompt_group = QGroupBox("SAM 3.1 Prompt Selection")
+        prompt_layout = QVBoxLayout(self.sam31_prompt_group)
+
+        self.sam31_prompt_edit = QLineEdit()
+        self.sam31_prompt_edit.setPlaceholderText("Example: person, red car, dog")
+        self.sam31_prompt_edit.setToolTip(
+            "Non-destructive semantic selection is evaluated in an isolated "
+            "SAM 3.1 session. "
+            "Existing point objects are not changed until candidates are accepted."
+        )
+        prompt_layout.addWidget(self.sam31_prompt_edit)
+
+        self.sam31_prompt_preview_btn = QPushButton("Preview Prompt Candidates")
+        prompt_layout.addWidget(self.sam31_prompt_preview_btn)
+
+        self.sam31_prompt_candidates = QListWidget()
+        self.sam31_prompt_candidates.setSelectionMode(
+            QAbstractItemView.ExtendedSelection
+        )
+        self.sam31_prompt_candidates.setToolTip(
+            "Select one or more candidates. The current item is previewed in the viewer."
+        )
+        self.sam31_prompt_candidates.setMinimumHeight(80)
+        prompt_layout.addWidget(self.sam31_prompt_candidates)
+
+        actions = QHBoxLayout()
+        self.sam31_prompt_accept_btn = QPushButton("Accept Selected")
+        self.sam31_prompt_cancel_btn = QPushButton("Cancel Preview")
+        self.sam31_prompt_accept_btn.setEnabled(False)
+        self.sam31_prompt_cancel_btn.setEnabled(False)
+        actions.addWidget(self.sam31_prompt_accept_btn)
+        actions.addWidget(self.sam31_prompt_cancel_btn)
+        prompt_layout.addLayout(actions)
+
+        self.sam31_prompt_status = QLabel(
+            "Preview is non-destructive. Accepting candidates explicitly reseeds "
+            "the SAM 3.1 object session. Use the In or Out frame when tracking."
+        )
+        self.sam31_prompt_status.setWordWrap(True)
+        self.sam31_prompt_status.setStyleSheet(
+            "QLabel { color: palette(mid); font-size: 10px; }"
+        )
+        prompt_layout.addWidget(self.sam31_prompt_status)
+        layout.addWidget(self.sam31_prompt_group)
+
+        self._prompt_candidate_data = []
+        self.sam_model_combo.currentTextChanged.connect(
+            self._update_sam31_prompt_visibility
+        )
+        self._update_sam31_prompt_visibility(self.sam_model_combo.currentText())
+
+    def _update_sam31_prompt_visibility(self, model_name):
+        self.sam31_prompt_group.setVisible(model_name == "SAM 3.1")
+
+    def set_prompt_candidates(self, candidates):
+        self._prompt_candidate_data = list(candidates)
+        self.sam31_prompt_candidates.clear()
+        for display_index, candidate in enumerate(candidates, start=1):
+            score = candidate.get("score")
+            score_text = "n/a" if score is None else f"{score:.3f}"
+            item = QListWidgetItem(
+                f"Candidate {display_index}  |  confidence {score_text}  |  "
+                f"area {candidate.get('area', 0):,} px"
+            )
+            item.setData(Qt.UserRole, int(candidate["candidate_id"]))
+            self.sam31_prompt_candidates.addItem(item)
+        has_candidates = bool(candidates)
+        self.sam31_prompt_accept_btn.setEnabled(has_candidates)
+        self.sam31_prompt_cancel_btn.setEnabled(has_candidates)
+        if has_candidates:
+            first = self.sam31_prompt_candidates.item(0)
+            first.setSelected(True)
+            self.sam31_prompt_candidates.setCurrentItem(first)
+            self.sam31_prompt_status.setText(
+                f"{len(candidates)} candidate(s) found. Select one or more, then accept."
+            )
+        else:
+            self.sam31_prompt_status.setText("No candidates matched this prompt.")
+
+    def selected_prompt_candidates(self):
+        selected_ids = {
+            int(item.data(Qt.UserRole))
+            for item in self.sam31_prompt_candidates.selectedItems()
+        }
+        return [
+            candidate
+            for candidate in self._prompt_candidate_data
+            if int(candidate["candidate_id"]) in selected_ids
+        ]
+
+    def current_prompt_candidate(self):
+        item = self.sam31_prompt_candidates.currentItem()
+        if item is None:
+            selected = self.sam31_prompt_candidates.selectedItems()
+            item = selected[0] if selected else None
+        if item is None:
+            return None
+        candidate_id = int(item.data(Qt.UserRole))
+        return next(
+            (
+                candidate
+                for candidate in self._prompt_candidate_data
+                if int(candidate["candidate_id"]) == candidate_id
+            ),
+            None,
+        )
+
+    def clear_prompt_candidates(self, status=None):
+        self._prompt_candidate_data = []
+        self.sam31_prompt_candidates.clear()
+        self.sam31_prompt_accept_btn.setEnabled(False)
+        self.sam31_prompt_cancel_btn.setEnabled(False)
+        if status is not None:
+            self.sam31_prompt_status.setText(status)
 
     def _create_clear_points_group(self, layout):
         """Create the Clear Points group with all clearing actions"""
@@ -445,6 +573,16 @@ class SegmentationTab(QWidget):
             self.sam_model_combo.setCurrentIndex(2)
         elif model == "SAM 3.1":
             self.sam_model_combo.setCurrentIndex(3)
+
+        prompt_text = settings_mgr.get_session_setting("sam31_prompt_text", "")
+        self.sam31_prompt_edit.setText(prompt_text)
+        prompt_mappings = settings_mgr.get_session_setting(
+            "sam31_prompt_mappings", []
+        )
+        if prompt_text and prompt_mappings:
+            self.sam31_prompt_status.setText(
+                f"Committed prompt: {prompt_text} ({len(prompt_mappings)} object(s))"
+            )
 
         # Update sliders
         slider_mappings = [
@@ -1934,6 +2072,21 @@ class MainWindow(QMainWindow):
             seg_tab.parent_window = self
             # Connect segmentation tab buttons
             seg_tab.sam_model_btn.clicked.connect(self.load_segmentation_model)
+            seg_tab.sam31_prompt_preview_btn.clicked.connect(
+                self.preview_sam31_prompt
+            )
+            seg_tab.sam31_prompt_accept_btn.clicked.connect(
+                self.accept_sam31_prompt_candidates
+            )
+            seg_tab.sam31_prompt_cancel_btn.clicked.connect(
+                self.cancel_sam31_prompt_preview
+            )
+            seg_tab.sam31_prompt_candidates.itemSelectionChanged.connect(
+                self.preview_current_sam31_prompt_candidate
+            )
+            seg_tab.sam31_prompt_candidates.currentItemChanged.connect(
+                lambda _current, _previous: self.preview_current_sam31_prompt_candidate()
+            )
             seg_tab.undo_last_point_btn.clicked.connect(self.undo_last_point)
             seg_tab.clear_frame_btn.clicked.connect(self.clear_frame_points)
             seg_tab.clear_object_btn.clicked.connect(self.clear_object_points)
@@ -2733,6 +2886,7 @@ class MainWindow(QMainWindow):
             
         elif action == 'clear_all':
             self.sam_manager.clear_tracking()
+            self.sam_manager.clear_text_prompt_seed()
             self.sam_manager.deduplicated = False
             self.matany_manager.propagated = False
             self.removal_manager.propagated = False
@@ -2752,6 +2906,11 @@ class MainWindow(QMainWindow):
                 self.removal_manager.propagated = False
             # Rebuild the entire table and update display
             self._refresh_table()
+
+        if action in {
+            'remove_last', 'clear_frame', 'clear_all', 'clear_object'
+        }:
+            self._persist_sam31_prompt_state()
             self._update_current_frame_display()
             
         elif action == 'load_all':
@@ -2905,6 +3064,7 @@ class MainWindow(QMainWindow):
         else:
             self.sam_manager.reset_state()
             self._update_current_frame_display()
+        self._persist_sam31_prompt_state()
 
         self.highlighted_point = None
         self.sam_manager.propagated = False
@@ -3047,6 +3207,262 @@ class MainWindow(QMainWindow):
             frame = self.frame_slider.value()
         return self.point_manager.get_points_for_frame(frame)
 
+    @staticmethod
+    def _prompt_seed_point(mask):
+        """Return a stable point well inside a semantic candidate mask."""
+        binary = (np.asarray(mask) > 0).astype(np.uint8)
+        if not np.any(binary):
+            raise ValueError("SAM 3.1 prompt candidate mask is empty")
+        distance = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+        _, _, _, location = cv2.minMaxLoc(distance)
+        return int(location[0]), int(location[1])
+
+    def preview_sam31_prompt(self):
+        seg_tab = self.sidebar.segmentation_tab
+        if seg_tab.sam_model_combo.currentText() != "SAM 3.1":
+            show_message_dialog(
+                self,
+                title="SAM 3.1 Required",
+                message="Select SAM 3.1 before using prompt selection.",
+                type="warning",
+            )
+            return
+        if self.sam_manager.sam31_backend is None:
+            show_message_dialog(
+                self,
+                title="Load SAM 3.1",
+                message="Press Load Model before previewing a semantic prompt.",
+                type="warning",
+            )
+            return
+        prompt = seg_tab.sam31_prompt_edit.text().strip()
+        if not prompt:
+            show_message_dialog(
+                self,
+                title="Prompt Required",
+                message="Enter a semantic prompt such as person, dog, or red car.",
+                type="warning",
+            )
+            return
+
+        frame = self.frame_slider.value()
+        progress = QProgressDialog(
+            "Running SAM 3.1 semantic selection...", None, 0, 0, self
+        )
+        progress.setWindowTitle("Prompt Selection")
+        progress.setModal(True)
+        progress.show()
+        QApplication.processEvents()
+        try:
+            candidates = self.sam_manager.preview_text_prompt(frame, prompt)
+            self._sam31_prompt_preview_frame = frame
+            seg_tab.set_prompt_candidates(candidates)
+            if candidates:
+                self.preview_current_sam31_prompt_candidate()
+                first_frame, last_frame = self._sam31_prompt_endpoint_frames()
+                if frame not in {first_frame, last_frame}:
+                    seg_tab.sam31_prompt_status.setText(
+                        f"{len(candidates)} candidate(s) found on frame {frame}. "
+                        f"Tracking requires an In ({first_frame}) or Out ({last_frame}) seed."
+                    )
+            print(
+                f"SAM 3.1 prompt '{prompt}' returned {len(candidates)} candidate(s) "
+                f"on frame {frame}"
+            )
+        except Exception as exc:
+            seg_tab.clear_prompt_candidates("Prompt preview failed.")
+            show_message_dialog(
+                self,
+                title="SAM 3.1 Prompt Error",
+                message=f"Unable to evaluate the prompt: {exc}",
+                type="warning",
+            )
+            print(f"SAM 3.1 prompt preview failed: {exc}")
+        finally:
+            progress.close()
+
+    def preview_current_sam31_prompt_candidate(self):
+        seg_tab = self.sidebar.segmentation_tab
+        candidate = seg_tab.current_prompt_candidate()
+        if candidate is None:
+            return
+        preview_frame = getattr(
+            self, "_sam31_prompt_preview_frame", self.frame_slider.value()
+        )
+        if self.frame_slider.value() != preview_frame:
+            self.frame_slider.setValue(preview_frame)
+        self._update_current_frame_display(preview_mask=candidate["mask"])
+
+    def cancel_sam31_prompt_preview(self):
+        self.sam_manager.discard_text_prompt_preview()
+        self.sidebar.segmentation_tab.clear_prompt_candidates(
+            "Prompt preview cancelled; the committed point session was unchanged."
+        )
+        self._sam31_prompt_preview_frame = None
+        self._update_current_frame_display()
+
+    def _allocate_prompt_object_ids(self, count):
+        preferred = self.sidebar.segmentation_tab.get_selected_object_id()
+        available = [preferred] + [
+            object_id for object_id in range(21) if object_id != preferred
+        ]
+        if count > len(available):
+            raise ValueError("Too many prompt candidates for the available object IDs")
+        return available[:count]
+
+    @staticmethod
+    def _directory_contains_png(directory):
+        """Return whether a generated-output directory contains PNG data."""
+        path = Path(directory)
+        return path.is_dir() and next(path.rglob("*.png"), None) is not None
+
+    def _sam31_prompt_endpoint_frames(self):
+        in_point = self.settings_mgr.get_session_setting("in_point", None)
+        out_point = self.settings_mgr.get_session_setting("out_point", None)
+        first_frame = 0 if in_point is None else int(in_point)
+        last_frame = (
+            core.VideoInfo.total_frames - 1
+            if out_point is None
+            else int(out_point)
+        )
+        return first_frame, last_frame
+
+    def accept_sam31_prompt_candidates(self):
+        seg_tab = self.sidebar.segmentation_tab
+        candidates = seg_tab.selected_prompt_candidates()
+        if not candidates:
+            show_message_dialog(
+                self,
+                title="Select Candidates",
+                message="Select at least one SAM 3.1 prompt candidate.",
+                type="warning",
+            )
+            return
+
+        candidate_ids = [int(candidate["candidate_id"]) for candidate in candidates]
+        studio_ids = self._allocate_prompt_object_ids(len(candidates))
+        prompt = seg_tab.sam31_prompt_edit.text().strip()
+        frame = getattr(
+            self, "_sam31_prompt_preview_frame", self.frame_slider.value()
+        )
+        first_frame, last_frame = self._sam31_prompt_endpoint_frames()
+        if frame not in {first_frame, last_frame}:
+            show_message_dialog(
+                self,
+                title="Endpoint Frame Required",
+                message=(
+                    "SAM 3.1 prompt candidates can only be accepted as tracking "
+                    f"anchors on the In frame ({first_frame}) or Out frame "
+                    f"({last_frame}). Move to an endpoint and preview the prompt again."
+                ),
+                type="warning",
+            )
+            return
+
+        existing_outputs = any(
+            self._directory_contains_png(directory)
+            for directory in (core.mask_dir, core.matting_dir, core.removal_dir)
+        )
+        existing_prompt = self.settings_mgr.get_session_setting(
+            "sam31_prompt_mappings", []
+        )
+        if self.point_manager.points or existing_prompt or existing_outputs:
+            reply = QMessageBox.question(
+                self,
+                "Reseed SAM 3.1 Objects",
+                "Accepting semantic candidates starts a new SAM 3.1 object seed. "
+                "Existing points, tracking masks, mattes, and removal results will "
+                "be cleared. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        try:
+            # Reset the old active session while leaving the isolated prompt
+            # preview alive long enough to adopt it atomically.
+            self.sam_manager.clear_tracking()
+            self.point_manager.points.clear()
+            self.settings_mgr.save_points([])
+            self._refresh_table()
+            self.matany_manager.clear_matting()
+            self.removal_manager.clear_removal()
+            sammie.remove_backup_mattes()
+
+            masks = self.sam_manager.commit_text_prompt(
+                candidate_ids, studio_ids
+            )
+            masks_by_id = {object_id: mask for object_id, mask in masks}
+            object_names = {}
+            for index, object_id in enumerate(studio_ids, start=1):
+                x, y = self._prompt_seed_point(masks_by_id[object_id])
+                self.point_manager.add_point(frame, object_id, True, x, y)
+                object_names[str(object_id)] = (
+                    prompt if len(studio_ids) == 1 else f"{prompt} {index}"
+                )
+            self.settings_mgr.set_session_setting("object_names", object_names)
+            self._persist_sam31_prompt_state()
+            self.settings_mgr.save_points(self.point_manager.get_all_points())
+            self.settings_mgr.save_session_settings()
+
+            seg_tab.object_spinbox.setValue(studio_ids[0])
+            seg_tab.clear_prompt_candidates(
+                f"Committed prompt: {prompt} ({len(studio_ids)} object(s)). "
+                "Use positive/negative points for refinement."
+            )
+            self._sam31_prompt_preview_frame = None
+            self._refresh_table()
+            self.update_tracking_status()
+            self.update_matting_status()
+            self.update_removal_status()
+            self._update_current_frame_display()
+            print(
+                f"Committed SAM 3.1 prompt '{prompt}' to Studio object IDs "
+                f"{studio_ids} on frame {frame}"
+            )
+        except Exception as exc:
+            show_message_dialog(
+                self,
+                title="SAM 3.1 Prompt Commit Error",
+                message=f"Unable to commit selected candidates: {exc}",
+                type="warning",
+            )
+            print(f"SAM 3.1 prompt commit failed: {exc}")
+
+    def _persist_sam31_prompt_state(self):
+        metadata = self.sam_manager.get_text_prompt_metadata()
+        if metadata is None:
+            if self.sam_manager.sam31_backend is None:
+                existing_mappings = self.settings_mgr.get_session_setting(
+                    "sam31_prompt_mappings", []
+                )
+                point_object_ids = {
+                    int(point["object_id"])
+                    for point in self.point_manager.get_all_points()
+                    if "object_id" in point
+                }
+                mappings = [
+                    mapping
+                    for mapping in existing_mappings
+                    if int(mapping.get("object_id", -1)) in point_object_ids
+                ]
+                if mappings:
+                    self.settings_mgr.set_session_setting(
+                        "sam31_prompt_mappings", mappings
+                    )
+                    self.settings_mgr.save_session_settings()
+                    return
+            text, frame, mappings = "", None, []
+        else:
+            text = metadata["text"]
+            frame = int(metadata["frame"])
+            mappings = metadata["mappings"]
+        self.settings_mgr.set_session_setting("sam31_prompt_text", text)
+        self.settings_mgr.set_session_setting("sam31_prompt_frame", frame)
+        self.settings_mgr.set_session_setting("sam31_prompt_mappings", mappings)
+        self.settings_mgr.save_session_settings()
+
     # ==================== PROCESSING OPERATIONS ====================
     
     def load_segmentation_model(self):
@@ -3055,6 +3471,9 @@ class MainWindow(QMainWindow):
         if model == self.sam_manager.loaded_model_name:
             print("Model is already loaded")
             return
+
+        if self.sam_manager.sam31_backend is not None:
+            self.cancel_sam31_prompt_preview()
 
         progress = QProgressDialog("Loading...", None, 0, 0, self)
         progress.setWindowTitle("Please Wait")
@@ -3321,16 +3740,27 @@ class MainWindow(QMainWindow):
         self.settings_mgr.set_app_setting("default_minimax_steps", self.settings_mgr.get_session_setting("minimax_steps", 6))
         
         if self.removal_tab.method_combo.currentText() == 'MiniMax-Remover':
+            suspended_sam31 = self.sam_manager.sam31_backend is not None
             try:
-                # offload sam model
-                self.sam_manager.offload_model_to_cpu()
+                if suspended_sam31:
+                    # SAM 3.1 cannot be CPU-offloaded. Fully release it before
+                    # loading MiniMax so both large models do not occupy VRAM.
+                    self.sam_manager.unload_segmentation_model()
+                else:
+                    self.sam_manager.offload_model_to_cpu()
                 QApplication.processEvents()
                 self.removal_manager.run_object_removal_minimax(self.point_manager.points, parent_window=self)
             except Exception as e:
                 if "out of memory" in str(e):
                     show_message_dialog(self, title="Error", message="An out of memory error occurred. Please try again with lower settings." , type="warning")
-                else: 
+                else:
                     print(f"An error occurred: {e}")
+                    show_message_dialog(
+                        self,
+                        title="Object Removal Error",
+                        message=f"MiniMax object removal failed:\n{e}",
+                        type="warning",
+                    )
             finally:
                 progress = QProgressDialog("Loading...", None, 0, 0, self)
                 progress.setWindowTitle("Please Wait")
@@ -3339,7 +3769,14 @@ class MainWindow(QMainWindow):
                 QApplication.processEvents()
                 self.removal_manager.unload_minimax_model()
                 QApplication.processEvents()
-                self.sam_manager.load_model_to_device()
+                if suspended_sam31:
+                    if self.sam_manager.load_segmentation_model("SAM 3.1", parent_window=self):
+                        self.sam_manager.initialize_predictor()
+                        self.sam_manager.replay_points(
+                            self.point_manager.get_all_points()
+                        )
+                else:
+                    self.sam_manager.load_model_to_device()
                 progress.close()
         else:
             self.removal_manager.run_object_removal_cv(self.point_manager.points, parent_window=self)
@@ -3703,23 +4140,63 @@ class MainWindow(QMainWindow):
         if not file_path or not os.path.exists(file_path):
             print(f"Invalid file path: {file_path}")
             return
+
+        if os.path.isdir(file_path):
+            sequences = discover_image_sequences(file_path)
+            if not sequences:
+                show_message_dialog(
+                    self,
+                    title="No Image Sequence Found",
+                    message=(
+                        "The dropped folder does not contain a numbered image "
+                        "sequence directly inside it. Movie folders are not "
+                        "loaded; drop the movie file itself."
+                    ),
+                    type="warning",
+                )
+                return
+
+            selected_sequence = sequences[0]
+            if len(sequences) > 1:
+                labels = [sequence_display_name(paths) for paths in sequences]
+                selected_label, accepted = QInputDialog.getItem(
+                    self,
+                    "Select Image Sequence",
+                    "Multiple image sequences were found in this folder:",
+                    labels,
+                    0,
+                    False,
+                )
+                if not accepted:
+                    return
+                selected_sequence = sequences[labels.index(selected_label)]
+
+            representative_file = selected_sequence[0]
+            print(
+                f"Dropped sequence folder: {file_path} "
+                f"({len(selected_sequence)} frames)"
+            )
+            self.load_file(
+                representative_file,
+                image_sequence_files=selected_sequence,
+            )
+            return
         
         # Check if file type is supported
-        supported_extensions = [
-            '.mp4', '.m4v', '.mkv', '.mov', '.avi', '.webm',
-            '.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.gif', '.webp'
-        ]
-        
         file_ext = os.path.splitext(file_path)[1].lower()
-        if file_ext not in supported_extensions:
+        if file_ext not in SUPPORTED_MEDIA_EXTENSIONS:
             print(f"Unsupported file type: {file_ext}")
-            file_error_text = f"File type '{file_ext}' is not supported.\n\n Supported formats: {', '.join(supported_extensions)}"
+            supported = ", ".join(sorted(SUPPORTED_MEDIA_EXTENSIONS))
+            file_error_text = (
+                f"File type '{file_ext}' is not supported.\n\n"
+                f"Supported formats: {supported}"
+            )
             show_message_dialog(self, title="Unsupported File", message=file_error_text, type="warning")
             return
         
         self.load_file(file_path)
         
-    def load_file(self, file_path):
+    def load_file(self, file_path, image_sequence_files=None):
         """Load a file (consolidated method for both menu and command line usage)"""
         # Clear all points and propagation data
         self.point_manager.clear_all()
@@ -3743,8 +4220,12 @@ class MainWindow(QMainWindow):
         file_ext = os.path.splitext(file_path)[1].lower()
         
         try:
-            if file_ext in ['.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.gif', '.webp']:
-                framecount = sammie.load_image_sequence(file_path, parent_window=self)
+            if file_ext in IMAGE_EXTENSIONS:
+                framecount = sammie.load_image_sequence(
+                    file_path,
+                    parent_window=self,
+                    sequence_files=image_sequence_files,
+                )
             else:
                 framecount = sammie.load_video(file_path, parent_window=self)
                 if framecount and framecount > 0:
@@ -3872,6 +4353,10 @@ class MainWindow(QMainWindow):
                 
                 self.point_manager.points = points
                 self.point_manager._notify('load_all')
+                self.sam_manager.clear_text_prompt_seed()
+                self.settings_mgr.set_session_setting("sam31_prompt_text", "")
+                self.settings_mgr.set_session_setting("sam31_prompt_frame", None)
+                self.settings_mgr.set_session_setting("sam31_prompt_mappings", [])
                 print(f"Loaded {len(points)} points from {file_name}")
                 self.clear_tracking_data() #clear tracking and replay points
             except Exception as e:

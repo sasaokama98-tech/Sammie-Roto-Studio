@@ -227,7 +227,21 @@ class ExportDialog(QDialog):
         # In/Out points
         self.use_inout_checkbox = QCheckBox("Export only between in/out markers")
         self.use_inout_checkbox.setChecked(True)
+        self.use_inout_checkbox.stateChanged.connect(self._update_filename_preview)
         settings_layout.addRow("", self.use_inout_checkbox)
+
+        # Output frame numbering (sequence formats only)
+        self.sequence_start_spin = QSpinBox()
+        self.sequence_start_spin.setRange(-999999, 9999999)
+        self.sequence_start_spin.setValue(0)
+        self.sequence_start_spin.setToolTip(
+            "Frame number assigned to the first exported EXR or PNG frame."
+        )
+        self.sequence_start_spin.valueChanged.connect(self._update_filename_preview)
+        settings_layout.addRow("Sequence Start Frame:", self.sequence_start_spin)
+        self.sequence_start_label = settings_layout.labelForField(
+            self.sequence_start_spin
+        )
         
         layout.addWidget(settings_group)
     
@@ -363,6 +377,11 @@ class ExportDialog(QDialog):
         # Include original
         show_include_original = self.current_format.supports_include_original
         self.include_original_checkbox.setVisible(show_include_original)
+
+        # Output numbering only applies to EXR and PNG sequences.
+        show_sequence_start = self.current_format.is_sequence
+        self.sequence_start_spin.setVisible(show_sequence_start)
+        self.sequence_start_label.setVisible(show_sequence_start)
         
         # Object selection - check output type as well
         output_type = self.output_type_combo.currentText()
@@ -417,7 +436,13 @@ class ExportDialog(QDialog):
             base_path = self.path_manager.generate_output_path(
                 folder, template, self.current_format.format_id, output_type
             )
-            preview = f"{base_path}{self.current_format.file_extension}"
+            extension = self.current_format.file_extension.rsplit(".", 1)[-1]
+            start_number = self.sequence_start_spin.value()
+            frame_count = self._export_frame_count()
+            end_number = start_number + max(0, frame_count - 1)
+            first_path = f"{base_path}.{start_number:04d}.{extension}"
+            last_path = f"{base_path}.{end_number:04d}.{extension}"
+            preview = first_path if frame_count <= 1 else f"{first_path}\n… {last_path}"
             self.filename_preview_label.setText(preview)
         elif self.export_multiple_checkbox.isChecked():
             # Multiple file preview
@@ -523,7 +548,8 @@ class ExportDialog(QDialog):
             in_point=in_point,
             out_point=out_point,
             include_original=self.include_original_checkbox.isChecked(),
-            export_multiple=self.export_multiple_checkbox.isChecked()
+            export_multiple=self.export_multiple_checkbox.isChecked(),
+            sequence_start_number=self.sequence_start_spin.value(),
         )
     
     def _generate_output_paths(self, settings: ExportSettings) -> tuple:
@@ -643,8 +669,10 @@ class ExportDialog(QDialog):
             start_frame = 0
             end_frame = total_frames - 1
         
-        # Check first few frames
-        for frame_num in range(start_frame, min(start_frame + 5, end_frame + 1)):
+        # Check the first few output numbers, not the internal source indexes.
+        frames_to_check = min(5, max(0, end_frame - start_frame + 1))
+        for offset in range(frames_to_check):
+            frame_num = settings.sequence_start_number + offset
             if self.current_format.format_id == 'exr':
                 frame_file = f"{base_path}.{frame_num:04d}.exr"
             else:  # PNG
@@ -765,6 +793,9 @@ class ExportDialog(QDialog):
         settings_mgr.set_app_setting('export_multiple', self.export_multiple_checkbox.isChecked())
         settings_mgr.set_app_setting('export_folder_path', self.folder_edit.text())
         settings_mgr.set_app_setting('export_use_inout', self.use_inout_checkbox.isChecked())
+        settings_mgr.set_app_setting(
+            'export_sequence_start_number', self.sequence_start_spin.value()
+        )
         
         settings_mgr.save_app_settings()
         QMessageBox.information(self, "Settings Saved", "Export settings have been saved as defaults.")
@@ -811,10 +842,26 @@ class ExportDialog(QDialog):
         self.use_inout_checkbox.setChecked(
             settings_mgr.get_app_setting('export_use_inout', True)
         )
+        self.sequence_start_spin.setValue(
+            settings_mgr.get_app_setting('export_sequence_start_number', 0)
+        )
         
         folder_path = settings_mgr.get_app_setting('export_folder_path', '')
         if folder_path and os.path.exists(folder_path):
             self.folder_edit.setText(folder_path)
+
+    def _export_frame_count(self) -> int:
+        """Return the number of source frames selected for export."""
+        total_frames = int(VideoInfo.total_frames)
+        if self.use_inout_checkbox.isChecked() and self.parent_window:
+            settings_mgr = self.parent_window.settings_mgr
+            in_point = settings_mgr.get_session_setting("in_point", None)
+            out_point = settings_mgr.get_session_setting("out_point", None)
+            if in_point is not None and out_point is not None:
+                start_frame = max(0, int(in_point))
+                end_frame = min(total_frames - 1, int(out_point))
+                return max(0, end_frame - start_frame + 1)
+        return max(0, total_frames)
     
     # === Helper Methods ===
     

@@ -34,6 +34,20 @@ class RemovalManager:
             except Exception as e:
                 print(f"Callback error: {e}")
 
+    @staticmethod
+    def removal_output_path(frame_number):
+        """Return the canonical lossless output path for a removal frame."""
+        return os.path.join(core.removal_dir, f"{int(frame_number):05d}.png")
+
+    @classmethod
+    def write_removal_frame(cls, frame_number, frame_bgr):
+        """Write one removal frame and fail loudly if OpenCV cannot save it."""
+        output_path = cls.removal_output_path(frame_number)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        if not cv2.imwrite(output_path, frame_bgr):
+            raise IOError(f"Failed to write removal frame: {output_path}")
+        return output_path
+
     def load_minimax_model(self, parent_window=None):
         from diffusers.models import AutoencoderKLWan
         from diffusers.schedulers import UniPCMultistepScheduler
@@ -226,15 +240,17 @@ class RemovalManager:
         print("Saving frames...")
         progress_dialog.setLabelText("Saving frames...")
         QApplication.processEvents()
-        extension = core.get_frame_extension()
-
         # Save processed frames
-        for i, frame in enumerate(output):
-            frame_number = start_frame + i
-            composited = self.composite_removal_over_original(frame, frame_number, points)
-            output_path = os.path.join(core.removal_dir, f"{frame_number:05d}.{extension}")
-            frame_bgr = cv2.cvtColor(composited, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(output_path, frame_bgr)
+        try:
+            for i, frame in enumerate(output):
+                frame_number = start_frame + i
+                composited = self.composite_removal_over_original(frame, frame_number, points)
+                frame_bgr = cv2.cvtColor(composited, cv2.COLOR_RGB2BGR)
+                self.write_removal_frame(frame_number, frame_bgr)
+        except Exception:
+            self.propagated = False
+            progress_dialog.close()
+            raise
 
         if frame_count == frames_to_process:  # only set propagated if the whole video was processed
             self.propagated = True
@@ -242,6 +258,7 @@ class RemovalManager:
             self.propagated = False
         print("Processing complete!")
         progress_dialog.close()
+        self._notify('removal_complete')
         return True
 
     def _load_all_frames_and_masks(self, points_list, inpaint_grow=5, start_frame=0, end_frame=None):
@@ -495,9 +512,7 @@ class RemovalManager:
 
             # Skip if no mask present, copy original frame
             if not np.any(combined_mask):
-                output_filename = os.path.join(core.removal_dir, f"{frame_number:05d}.png")
-                os.makedirs(os.path.dirname(output_filename), exist_ok=True)
-                cv2.imwrite(output_filename, frame)
+                self.write_removal_frame(frame_number, frame)
                 operations_completed += 1
                 tqdm_bar.update(1)
                 progress_dialog.setValue(operations_completed)
@@ -516,15 +531,11 @@ class RemovalManager:
             # Run inpainting
             try:
                 result = cv2.inpaint(frame, combined_mask, inpaint_radius, cv2_method)
-                output_filename = os.path.join(core.removal_dir, f"{frame_number:05d}.png")
-                os.makedirs(os.path.dirname(output_filename), exist_ok=True)
-                cv2.imwrite(output_filename, result)
+                self.write_removal_frame(frame_number, result)
 
             except Exception as e:
                 print(f"Error inpainting frame {frame_number}: {e}")
-                output_filename = os.path.join(core.removal_dir, f"{frame_number:05d}.png")
-                os.makedirs(os.path.dirname(output_filename), exist_ok=True)
-                cv2.imwrite(output_filename, frame)
+                self.write_removal_frame(frame_number, frame)
 
             operations_completed += 1
             tqdm_bar.update(1)

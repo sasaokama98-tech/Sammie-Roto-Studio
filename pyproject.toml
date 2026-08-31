@@ -1,6 +1,6 @@
 [project]
 name = "Sammie-Roto-Studio"
-version = "2.4.0+studio.1"
+version = "2.4.0+studio.2"
 description = "VFX-focused SAM tracking and high-quality matting application"
 requires-python = ">=3.11"
 
