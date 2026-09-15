@@ -675,6 +675,112 @@ class Sam31Backend:
                 mapped.append((internal_id, mask))
         return mapped
 
+    @staticmethod
+    def _has_nonempty_object_mask(
+        masks: list[tuple[int, np.ndarray]], object_id: int
+    ) -> bool:
+        return any(
+            int(output_id) == int(object_id) and np.asarray(mask).any()
+            for output_id, mask in masks
+        )
+
+    def _submit_point_prompt(
+        self,
+        frame_number: int,
+        internal_object_id: int,
+        normalized_points: np.ndarray,
+        point_labels: np.ndarray,
+        clear_old_points: bool,
+    ) -> list[tuple[int, np.ndarray]]:
+        response = self.predictor.handle_request(
+            {
+                "type": "add_prompt",
+                "session_id": self.session_id,
+                "frame_index": frame_number,
+                "points": normalized_points,
+                "point_labels": point_labels,
+                "obj_id": internal_object_id,
+                "clear_old_points": clear_old_points,
+                "rel_coordinates": True,
+            }
+        )
+        return self._mapped_masks_from_outputs(response["outputs"])
+
+    def _retry_single_positive_point(
+        self,
+        frame_number: int,
+        object_id: int,
+        internal_object_id: int,
+        normalized_points: np.ndarray,
+        point_labels: np.ndarray,
+        clear_old_points: bool,
+    ) -> list[tuple[int, np.ndarray]]:
+        """Recover when the first-click multimask candidate is empty.
+
+        The official tracker intentionally enables multimask only for the first
+        click. Some checkpoint/runtime combinations can rank an empty candidate
+        highest. Retry the same authored point through the single-mask token,
+        then use an adjacent-pixel positive point only if that still fails.
+        """
+
+        model = getattr(self.predictor, "model", None)
+        tracker = getattr(model, "tracker", None)
+        if tracker is not None and hasattr(tracker, "multimask_output_in_sam"):
+            original_multimask = tracker.multimask_output_in_sam
+            try:
+                tracker.multimask_output_in_sam = False
+                masks = self._submit_point_prompt(
+                    frame_number,
+                    internal_object_id,
+                    normalized_points,
+                    point_labels,
+                    clear_old_points,
+                )
+            finally:
+                tracker.multimask_output_in_sam = original_multimask
+            if self._has_nonempty_object_mask(masks, object_id):
+                print(
+                    "SAM 3.1 single-point recovery: used the single-mask "
+                    f"decoder for frame {frame_number}, object {object_id}."
+                )
+                return masks
+
+        width, height = self.frame_size
+        one_pixel = np.asarray(
+            [1.0 / max(width, 1), 1.0 / max(height, 1)], dtype=np.float32
+        )
+        direction = np.where(normalized_points[0] >= 0.5, -1.0, 1.0)
+        adjacent_point = np.clip(
+            normalized_points[0] + one_pixel * direction, 0.0, 1.0
+        )
+        retry_points = np.vstack((normalized_points, adjacent_point)).astype(
+            np.float32
+        )
+        retry_labels = np.asarray([1, 1], dtype=np.int32)
+        masks = self._submit_point_prompt(
+            frame_number,
+            internal_object_id,
+            retry_points,
+            retry_labels,
+            clear_old_points,
+        )
+        if self._has_nonempty_object_mask(masks, object_id):
+            print(
+                "SAM 3.1 single-point recovery: used an adjacent-pixel "
+                f"positive seed for frame {frame_number}, object {object_id}."
+            )
+        else:
+            print(
+                "SAM 3.1 single positive point produced an empty mask after "
+                f"recovery attempts on frame {frame_number}, object {object_id}."
+            )
+            raise RuntimeError(
+                "SAM 3.1 could not create a mask from the positive point. "
+                "Move the point farther inside the object or add another "
+                "positive point."
+            )
+        return masks
+
     def add_points(
         self,
         frame_number: int,
@@ -691,19 +797,30 @@ class Sam31Backend:
             raise ValueError("SAM 3.1 point labels must match the point count")
         self.ensure_prompt_seed()
         internal_object_id = self._internal_object_id(object_id)
-        response = self.predictor.handle_request(
-            {
-                "type": "add_prompt",
-                "session_id": self.session_id,
-                "frame_index": frame_number,
-                "points": normalized_points,
-                "point_labels": point_labels,
-                "obj_id": internal_object_id,
-                "clear_old_points": clear_old_points,
-                "rel_coordinates": True,
-            }
+        masks = self._submit_point_prompt(
+            frame_number,
+            internal_object_id,
+            normalized_points,
+            point_labels,
+            clear_old_points,
         )
-        return self._mapped_masks_from_outputs(response["outputs"])
+        is_single_positive = (
+            len(normalized_points) == 1
+            and len(point_labels) == 1
+            and int(point_labels[0]) == 1
+        )
+        if is_single_positive and not self._has_nonempty_object_mask(
+            masks, object_id
+        ):
+            masks = self._retry_single_positive_point(
+                frame_number,
+                object_id,
+                internal_object_id,
+                normalized_points,
+                point_labels,
+                clear_old_points,
+            )
+        return masks
 
     def propagate(
         self,

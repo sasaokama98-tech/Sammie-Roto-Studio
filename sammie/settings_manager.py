@@ -169,6 +169,7 @@ class SessionSettings:
     hybrid_flow_resolution: int = 720
     hybrid_evaluation_enabled: bool = False
     hybrid_evaluation_label: str = ""
+    hybrid_ground_truth_dir: str = ""
     hybrid_edge_width: int = 12
     hybrid_edge_feather: int = 4
     memory_profile: str = CUSTOM

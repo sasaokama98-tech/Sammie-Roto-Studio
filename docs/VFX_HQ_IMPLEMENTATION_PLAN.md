@@ -38,6 +38,10 @@ legacy runtimes until compatibility tests pass.
 - Convert UI points from original-frame pixels to normalized 0..1 coordinates
   before using SAM 3.1's relative-coordinate point API. Passing source pixels
   directly as model-space coordinates breaks selection on non-1008 footage.
+- Recover an empty first-click multimask by retrying the authored positive point
+  through the single-mask decoder, then an adjacent-pixel positive seed. The
+  synthetic seed is not added to the Studio point table, and an unrecoverable
+  empty mask now reports an explicit error instead of failing silently.
 - Stage PNG/TIFF frames as high-quality JPEG only for SAM 3.1 model input.
   Original footage remains the source for display, matting, and export.
 - Generate automatic 0/128/255 trimaps next to each coarse mask under
@@ -144,7 +148,7 @@ Pending validation:
 
 See `PHASE3_MEMATTE.md` for local runtime setup and current limitations.
 
-## Phase 4 — Hybrid HQ (Phase 4.3 implemented)
+## Phase 4 — Hybrid HQ (Phase 4.4 implemented)
 
 Implemented:
 
@@ -164,14 +168,17 @@ Implemented:
   bidirectional motion confidence.
 - Named Phase 4.3 evaluation archives with temporal/final/confidence mattes,
   per-frame JSON diagnostics, and an append-only comparison CSV.
+- Optional Phase 4.4 ground-truth evaluation of both the temporal base and
+  final Hybrid result with SAD/MSE/Gradient/Connectivity/dtSSD, strict frame
+  and object completeness, archived GT alpha, and a separate comparison CSV.
 
 Pending validation and follow-up:
 
 - Compare MatAnyone2 and VideoMaMa bases on the full VFX fixture and record
   edge detail, flicker, VRAM, and time.
 - Tune edge width/feather defaults for hair, motion blur, and defocus.
-- Add ground-truth SAD/MSE/Grad/Conn and formal dtSSD fixture scoring; current
-  Phase 4.3 metrics are intentionally no-reference comparisons.
+- Run the new Phase 4.4 metrics on the full ground-truth fixture and establish
+  acceptance thresholds for each shot class.
 See `PHASE4_HYBRID_HQ.md` for processing semantics and controls.
 
 ## Phase 5 — Memory/performance profiles (implemented)

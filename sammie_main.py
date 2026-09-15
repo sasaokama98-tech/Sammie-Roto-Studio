@@ -854,7 +854,8 @@ class MattingTab(QWidget):
         )
         self.hybrid_evaluation_checkbox.setToolTip(
             "Archive temporal/final mattes and confidence images, then write "
-            "Phase 4.3 no-reference comparison metrics. This uses additional disk space."
+            "Phase 4.3 no-reference metrics or Phase 4.4 ground-truth metrics. "
+            "This uses additional disk space."
         )
         self.hybrid_evaluation_label = QLabel("Evaluation Label:")
         self.hybrid_evaluation_edit = QLineEdit()
@@ -869,6 +870,33 @@ class MattingTab(QWidget):
             "Optional run name used under temp/hybrid_evaluation. Existing runs "
             "are never overwritten."
         )
+        self.hybrid_ground_truth_label = QLabel("Ground Truth Alpha:")
+        self.hybrid_ground_truth_edit = QLineEdit()
+        self.hybrid_ground_truth_edit.setPlaceholderText("Optional folder")
+        self.hybrid_ground_truth_edit.setText(
+            settings_mgr.get_session_setting("hybrid_ground_truth_dir", "")
+        )
+        self.hybrid_ground_truth_edit.setToolTip(
+            "Optional alpha folder for formal SAD/MSE/Gradient/Connectivity/"
+            "dtSSD scoring. Use <frame>/<object>.png or "
+            "<object>/<frame>.png; flat <frame>.png is accepted for one "
+            "object. Original sequence numbers are matched first, then "
+            "internal indexes starting at 00000."
+        )
+        self.hybrid_ground_truth_browse = QPushButton("Browse...")
+        self.hybrid_ground_truth_browse.setToolTip(
+            "Select the folder containing ground-truth alpha mattes."
+        )
+        self.hybrid_ground_truth_edit.setEnabled(
+            self.hybrid_evaluation_checkbox.isChecked()
+        )
+        self.hybrid_ground_truth_browse.setEnabled(
+            self.hybrid_evaluation_checkbox.isChecked()
+        )
+        self.hybrid_ground_truth_row = QHBoxLayout()
+        self.hybrid_ground_truth_row.setContentsMargins(0, 0, 0, 0)
+        self.hybrid_ground_truth_row.addWidget(self.hybrid_ground_truth_edit)
+        self.hybrid_ground_truth_row.addWidget(self.hybrid_ground_truth_browse)
         self.hybrid_edge_label = QLabel("Hybrid Edge Width:")
         self.hybrid_edge_spin = QSpinBox()
         self.hybrid_edge_spin.setRange(0, 256)
@@ -909,6 +937,8 @@ class MattingTab(QWidget):
             self.hybrid_flow_resolution_combo,
             self.hybrid_evaluation_checkbox,
             self.hybrid_evaluation_edit,
+            self.hybrid_ground_truth_edit,
+            self.hybrid_ground_truth_browse,
             self.hybrid_edge_spin,
             self.hybrid_feather_spin,
         )
@@ -946,10 +976,12 @@ class MattingTab(QWidget):
         trimap_layout.addWidget(self.hybrid_evaluation_checkbox, 15, 0, 1, 2)
         trimap_layout.addWidget(self.hybrid_evaluation_label, 16, 0)
         trimap_layout.addWidget(self.hybrid_evaluation_edit, 16, 1)
-        trimap_layout.addWidget(self.hybrid_edge_label, 17, 0)
-        trimap_layout.addWidget(self.hybrid_edge_spin, 17, 1)
-        trimap_layout.addWidget(self.hybrid_feather_label, 18, 0)
-        trimap_layout.addWidget(self.hybrid_feather_spin, 18, 1)
+        trimap_layout.addWidget(self.hybrid_ground_truth_label, 17, 0)
+        trimap_layout.addLayout(self.hybrid_ground_truth_row, 17, 1)
+        trimap_layout.addWidget(self.hybrid_edge_label, 18, 0)
+        trimap_layout.addWidget(self.hybrid_edge_spin, 18, 1)
+        trimap_layout.addWidget(self.hybrid_feather_label, 19, 0)
+        trimap_layout.addWidget(self.hybrid_feather_spin, 19, 1)
 
         # Connect to save settings when changed
         self.matany_model_combo.currentTextChanged.connect(self._save_model_setting)
@@ -993,6 +1025,12 @@ class MattingTab(QWidget):
         )
         self.hybrid_evaluation_edit.textChanged.connect(
             self._save_hybrid_settings
+        )
+        self.hybrid_ground_truth_edit.textChanged.connect(
+            self._save_hybrid_settings
+        )
+        self.hybrid_ground_truth_browse.clicked.connect(
+            self._browse_hybrid_ground_truth
         )
         self.hybrid_edge_spin.valueChanged.connect(self._save_hybrid_settings)
         self.hybrid_feather_spin.valueChanged.connect(self._save_hybrid_settings)
@@ -1255,6 +1293,9 @@ class MattingTab(QWidget):
         self.hybrid_evaluation_checkbox.setVisible(is_hybrid)
         self.hybrid_evaluation_label.setVisible(is_hybrid)
         self.hybrid_evaluation_edit.setVisible(is_hybrid)
+        self.hybrid_ground_truth_label.setVisible(is_hybrid)
+        self.hybrid_ground_truth_edit.setVisible(is_hybrid)
+        self.hybrid_ground_truth_browse.setVisible(is_hybrid)
         self.hybrid_edge_label.setVisible(is_hybrid)
         self.hybrid_edge_spin.setVisible(is_hybrid)
         self.hybrid_feather_label.setVisible(is_hybrid)
@@ -1285,8 +1326,13 @@ class MattingTab(QWidget):
         settings_mgr.set_session_setting(
             "hybrid_evaluation_label", self.hybrid_evaluation_edit.text().strip()
         )
-        self.hybrid_evaluation_edit.setEnabled(
-            self.hybrid_evaluation_checkbox.isChecked()
+        evaluation_enabled = self.hybrid_evaluation_checkbox.isChecked()
+        self.hybrid_evaluation_edit.setEnabled(evaluation_enabled)
+        self.hybrid_ground_truth_edit.setEnabled(evaluation_enabled)
+        self.hybrid_ground_truth_browse.setEnabled(evaluation_enabled)
+        settings_mgr.set_session_setting(
+            "hybrid_ground_truth_dir",
+            self.hybrid_ground_truth_edit.text().strip(),
         )
         settings_mgr.set_session_setting(
             "hybrid_edge_width", self.hybrid_edge_spin.value()
@@ -1296,6 +1342,16 @@ class MattingTab(QWidget):
         )
         if self.matany_model_combo.currentText() == "Hybrid HQ":
             self._save_model_setting("Hybrid HQ")
+
+    def _browse_hybrid_ground_truth(self):
+        current = self.hybrid_ground_truth_edit.text().strip()
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select Ground-Truth Alpha Folder",
+            current or "",
+        )
+        if directory:
+            self.hybrid_ground_truth_edit.setText(directory)
 
     def _apply_memory_profile(self, name):
         settings_mgr = get_settings_manager()
@@ -1484,6 +1540,9 @@ class MattingTab(QWidget):
         )
         self.hybrid_evaluation_edit.setText(
             settings_mgr.get_session_setting("hybrid_evaluation_label", "")
+        )
+        self.hybrid_ground_truth_edit.setText(
+            settings_mgr.get_session_setting("hybrid_ground_truth_dir", "")
         )
         self.hybrid_edge_spin.setValue(
             settings_mgr.get_session_setting("hybrid_edge_width", 12)

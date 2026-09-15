@@ -45,6 +45,10 @@ An optional Phase 4.2 Motion Confidence mode adds bidirectional DIS alignment
 with per-pixel forward/backward fallback; it remains experimental and off by
 default. Phase 4.3 can archive named temporal/final/confidence runs and write
 no-reference boundary and flow-warped comparison metrics plus a summary CSV.
+Phase 4.4 optionally scores both the temporal base and final Hybrid matte
+against a complete ground-truth alpha sequence with SAD, MSE, gradient,
+connectivity, and dtSSD metrics. Ground-truth evaluation remains opt-in and
+does not change normal Hybrid HQ processing.
 Controls and processing semantics are documented in
 [`docs/PHASE4_HYBRID_HQ.md`](docs/PHASE4_HYBRID_HQ.md).
 Memory Safe, Balanced, Fast, and automatically preserved Custom policies are

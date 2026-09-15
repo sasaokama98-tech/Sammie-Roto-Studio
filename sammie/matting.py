@@ -1417,6 +1417,9 @@ class HybridHQManager(MattingManager):
         requested_label = settings_mgr.get_session_setting(
             "hybrid_evaluation_label", ""
         ).strip()
+        ground_truth_dir = settings_mgr.get_session_setting(
+            "hybrid_ground_truth_dir", ""
+        ).strip()
         run_label = requested_label or "_".join(
             (
                 temporal_model.lower(),
@@ -1427,7 +1430,8 @@ class HybridHQManager(MattingManager):
         progress = QProgressDialog(
             "Preparing Hybrid HQ evaluation...", "Cancel", 0, 100, parent_window
         )
-        progress.setWindowTitle("Hybrid HQ Phase 4.3 Evaluation")
+        evaluation_phase = "4.4" if ground_truth_dir else "4.3"
+        progress.setWindowTitle(f"Hybrid HQ Phase {evaluation_phase} Evaluation")
         progress.setWindowModality(Qt.WindowModal)
         progress.setAutoClose(True)
         progress.show()
@@ -1463,17 +1467,29 @@ class HybridHQManager(MattingManager):
                         "hybrid_edge_feather", 4
                     ),
                 },
+                ground_truth_dir=ground_truth_dir or None,
+                source_frame_numbers=settings_mgr.get_session_setting(
+                    "source_frame_numbers", []
+                ),
+                source_frame_padding=int(
+                    settings_mgr.get_session_setting("source_frame_padding", 0)
+                    or 0
+                ),
                 flow_resolution=flow_resolution,
                 progress_callback=update,
                 cancel_callback=progress.wasCanceled,
             )
-            print(f"Hybrid HQ Phase 4.3 evaluation: {report_path}")
+            print(f"Hybrid HQ Phase {evaluation_phase} evaluation: {report_path}")
             return report_path
         except HybridEvaluationCancelled:
-            print("Hybrid HQ Phase 4.3 evaluation cancelled; mattes were preserved")
+            print(
+                f"Hybrid HQ Phase {evaluation_phase} evaluation cancelled; "
+                "mattes were preserved"
+            )
         except Exception as exc:
             print(
-                "Hybrid HQ Phase 4.3 evaluation failed; mattes were preserved: "
+                f"Hybrid HQ Phase {evaluation_phase} evaluation failed; "
+                "mattes were preserved: "
                 f"{exc}"
             )
         finally:
@@ -1547,7 +1563,14 @@ class HybridHQManager(MattingManager):
                 return 0
 
             if evaluation_enabled:
-                print("Hybrid HQ stage 3/3: no-reference evaluation and archive")
+                ground_truth_dir = settings_mgr.get_session_setting(
+                    "hybrid_ground_truth_dir", ""
+                ).strip()
+                evaluation_kind = (
+                    "ground-truth evaluation" if ground_truth_dir
+                    else "no-reference evaluation"
+                )
+                print(f"Hybrid HQ stage 3/3: {evaluation_kind} and archive")
                 with profiler.stage("evaluation", frame_equivalents):
                     self._run_evaluation_stage(
                         points_list, parent_window, combined, temporal_model

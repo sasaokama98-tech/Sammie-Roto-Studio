@@ -46,6 +46,12 @@ the original Phase 4 merge for direct comparison.
 - **Evaluation Label**: Optional comparison name. A model/preset-based name is
   generated when blank, and a numeric suffix is added instead of overwriting
   an existing run.
+- **Ground Truth Alpha**: Optional folder for formal Phase 4.4 scoring. Leave
+  blank to retain the Phase 4.3 no-reference workflow. The folder can use
+  `<frame>/<object>.png` or `<object>/<frame>.png`; a flat `<frame>.png`
+  sequence is accepted when evaluating one object. For loaded image sequences,
+  original source frame numbers are matched first; internal zero-based indexes
+  (`00000`, `00001`, ...) remain a fallback and are used for movies.
 - **Hybrid Edge Width**: Adds a pixel safety band around the temporal 0.5
   contour. Soft temporal pixels are always part of the unknown region.
 - **Hybrid Edge Feather**: Blends between temporal and MEMatte alpha at the
@@ -94,13 +100,39 @@ one comparison row per object, which makes runs easy to compare externally.
 
 These are no-reference production diagnostics. They measure changes relative
 to the run's own temporal base and cannot prove absolute matte accuracy.
-Ground-truth SAD, MSE, gradient, connectivity, and formal dtSSD remain separate
-fixture-validation work.
+
+## Phase 4.4 ground-truth metrics
+
+When `Ground Truth Alpha` is set, Studio strictly requires a readable,
+same-resolution alpha for every evaluated frame and object. It evaluates both
+the temporal base and final Hybrid matte, so the report shows whether MEMatte
+refinement improved or regressed each metric. Missing or mismatched ground
+truth fails only the optional evaluation stage; completed mattes are preserved.
+
+The run additionally contains:
+
+```text
+temp/hybrid_evaluation/<run>/ground_truth/<frame>/<object>.<ext>
+temp/hybrid_evaluation/ground_truth_summary.csv
+```
+
+`report.json` stores per-frame and aggregate SAD, MSE, Gaussian-gradient, and
+connectivity errors plus per-pair dtSSD. All metrics are lower-is-better. SAD,
+gradient, and connectivity use the conventional `/1000` benchmark scaling;
+MSE is mean squared alpha error; dtSSD is temporal-derivative RMS multiplied by
+100. The separate CSV keeps the existing Phase 4.3 summary schema compatible.
+
+The implementation follows the Alpha Matting benchmark definitions and the
+dtSSD convention used by the official MatAnyone2 evaluation code:
+
+- https://www.alphamatting.com/
+- https://github.com/pq-yang/MatAnyone2/blob/main/evaluation/eval_crgnn.py
 
 ## Current validation boundary
 
 Edge-band construction, 8/16-bit normalization, known-region preservation,
 feathering, combined-object mapping, manager selection, GUI visibility,
-evaluation archive safety, metric generation, and summary output are covered
-by automated tests. Full fixture comparison still requires matched MatAnyone2
-and VideoMaMa runs plus production review.
+evaluation archive safety, no-reference and ground-truth metric generation,
+strict GT completeness, and summary output are covered by automated tests.
+Full fixture comparison still requires matched MatAnyone2 and VideoMaMa runs
+plus production review.

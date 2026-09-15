@@ -119,6 +119,50 @@ class HybridEvaluationTests(unittest.TestCase):
             self.assertTrue(existing.exists())
             self.assertFalse((output / "cancelled").exists())
 
+    def test_ground_truth_metrics_and_archive_are_added_when_requested(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = self._make_sequence(root)
+            ground_truth = root / "ground_truth"
+            for frame in range(3):
+                source = paths[2] / f"{frame:05d}" / "0.png"
+                target = ground_truth / f"{frame:05d}"
+                target.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(
+                    str(target / "0.png"),
+                    cv2.imread(str(source), cv2.IMREAD_UNCHANGED),
+                )
+
+            report_path = evaluate_hybrid_run(
+                frames_dir=paths[0],
+                matting_dir=paths[1],
+                temporal_dir=paths[2],
+                trimap_dir=paths[3],
+                confidence_dir=paths[4],
+                output_root=root / "evaluation",
+                frame_range=(0, 2),
+                object_ids=[0],
+                frame_extension="png",
+                run_label="ground_truth",
+                settings={"temporal_model": "MatAnyone2"},
+                ground_truth_dir=ground_truth,
+                flow_resolution=32,
+            )
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+            self.assertIn("ground_truth_metrics", report)
+            self.assertEqual(report["phase"], "4.4")
+            result = report["ground_truth_metrics"]["objects"][0]
+            self.assertEqual(result["temporal"]["aggregate"]["sad_mean"], 0.0)
+            self.assertGreater(result["final"]["aggregate"]["sad_mean"], 0.0)
+            self.assertTrue(
+                (report_path.parent / "ground_truth" / "00002" / "0.png").exists()
+            )
+            self.assertTrue(
+                (root / "evaluation" / "ground_truth_summary.csv").exists()
+            )
+
     def test_run_label_is_sanitized(self):
         self.assertEqual(sanitize_run_label("  A/B: C  "), "A_B_C")
 

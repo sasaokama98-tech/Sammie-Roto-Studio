@@ -6,7 +6,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import cv2
 
+from sammie import core
 from sammie.sam31_backend import Sam31Backend, _CheckpointKeyOutputFilter
 from sammie.sammie import SamManager
 
@@ -38,6 +40,47 @@ class _FakePredictor:
             "outputs": {
                 "out_obj_ids": np.array([7]),
                 "out_binary_masks": np.ones((1, 4, 5), dtype=bool),
+            },
+        }
+
+
+class _TrackerFlags:
+    multimask_output_in_sam = True
+
+
+class _SinglePointEmptyPredictor:
+    def __init__(
+        self,
+        recover_with_single_mask=True,
+        recover_with_adjacent_point=True,
+    ):
+        self.requests = []
+        self.model = type("Model", (), {"tracker": _TrackerFlags()})()
+        self.recover_with_single_mask = recover_with_single_mask
+        self.recover_with_adjacent_point = recover_with_adjacent_point
+
+    def handle_request(self, request):
+        self.requests.append(request)
+        points = np.asarray(request["points"])
+        use_multimask = self.model.tracker.multimask_output_in_sam
+        succeeds = (len(points) > 1 and self.recover_with_adjacent_point) or (
+            not use_multimask and self.recover_with_single_mask
+        )
+        masks = (
+            np.ones((1, 4, 5), dtype=bool)
+            if succeeds
+            else np.zeros((0, 4, 5), dtype=bool)
+        )
+        object_ids = (
+            np.asarray([request["obj_id"]], dtype=np.int64)
+            if succeeds
+            else np.zeros(0, dtype=np.int64)
+        )
+        return {
+            "frame_index": request["frame_index"],
+            "outputs": {
+                "out_obj_ids": object_ids,
+                "out_binary_masks": masks,
             },
         }
 
@@ -202,6 +245,84 @@ class Sam31BackendTests(unittest.TestCase):
                 points=[[1921, 270]],
                 labels=[1],
             )
+
+    def test_single_positive_retries_empty_multimask_as_single_mask(self):
+        predictor = _SinglePointEmptyPredictor(recover_with_single_mask=True)
+        self.backend.predictor = predictor
+
+        masks = self.backend.add_points(2, 7, [[960, 270]], [1])
+
+        self.assertEqual(len(predictor.requests), 2)
+        self.assertTrue(predictor.model.tracker.multimask_output_in_sam)
+        self.assertTrue(masks[0][1].any())
+
+    def test_single_positive_uses_adjacent_seed_if_single_mask_is_empty(self):
+        predictor = _SinglePointEmptyPredictor(recover_with_single_mask=False)
+        self.backend.predictor = predictor
+
+        masks = self.backend.add_points(2, 7, [[960, 270]], [1])
+
+        self.assertEqual(len(predictor.requests), 3)
+        retry_points = np.asarray(predictor.requests[-1]["points"])
+        self.assertEqual(retry_points.shape, (2, 2))
+        self.assertTrue(masks[0][1].any())
+
+    def test_single_negative_does_not_trigger_positive_recovery(self):
+        predictor = _SinglePointEmptyPredictor(recover_with_single_mask=True)
+        self.backend.predictor = predictor
+
+        masks = self.backend.add_points(2, 7, [[960, 270]], [0])
+
+        self.assertEqual(masks, [])
+        self.assertEqual(len(predictor.requests), 1)
+
+    def test_single_positive_failure_is_not_silent_after_recovery(self):
+        predictor = _SinglePointEmptyPredictor(
+            recover_with_single_mask=False,
+            recover_with_adjacent_point=False,
+        )
+        self.backend.predictor = predictor
+
+        with self.assertRaisesRegex(RuntimeError, "could not create a mask"):
+            self.backend.add_points(2, 7, [[960, 270]], [1])
+
+        self.assertEqual(len(predictor.requests), 3)
+
+    def test_recovered_single_positive_writes_mask_and_trimap(self):
+        predictor = _SinglePointEmptyPredictor(recover_with_single_mask=True)
+        self.backend.predictor = predictor
+        manager = SamManager()
+        manager.sam31_backend = self.backend
+        manager.predictor = predictor
+        manager.inference_state = {"session_id": "session"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frames = root / "frames"
+            masks = root / "masks"
+            trimaps = root / "trimaps"
+            frames.mkdir()
+            cv2.imwrite(
+                str(frames / "00000.png"),
+                np.zeros((4, 5, 3), dtype=np.uint8),
+            )
+            with patch.object(core, "frames_dir", str(frames)), patch.object(
+                core, "mask_dir", str(masks)
+            ), patch.object(core, "trimap_dir", str(trimaps)), patch.object(
+                core, "get_frame_extension", return_value="png"
+            ):
+                manager.segment_image(0, 7, [[960, 270]], [1])
+
+            mask = cv2.imread(
+                str(masks / "00000" / "7.png"), cv2.IMREAD_GRAYSCALE
+            )
+            trimap = cv2.imread(
+                str(trimaps / "00000" / "7.png"), cv2.IMREAD_GRAYSCALE
+            )
+
+        self.assertIsNotNone(mask)
+        self.assertTrue(mask.any())
+        self.assertIsNotNone(trimap)
 
     def test_propagation_direction_is_mapped(self):
         frames = list(self.backend.propagate(2, 4, reverse=True))

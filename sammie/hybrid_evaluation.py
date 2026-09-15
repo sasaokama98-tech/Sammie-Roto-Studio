@@ -19,6 +19,10 @@ import cv2
 import numpy as np
 
 from sammie.hybrid_hq import alpha_to_float
+from sammie.ground_truth_metrics import (
+    evaluate_ground_truth,
+    resolve_ground_truth_path,
+)
 from sammie.motion_confidence import (
     calculate_bidirectional_alignment,
     warp_source_to_target,
@@ -215,6 +219,55 @@ def _write_summary_csv(output_root: Path, report: dict) -> None:
             )
 
 
+def _write_ground_truth_summary_csv(output_root: Path, report: dict) -> None:
+    ground_truth = report.get("ground_truth_metrics")
+    if not ground_truth:
+        return
+    path = output_root / "ground_truth_summary.csv"
+    metric_names = (
+        "sad_mean",
+        "mse_mean",
+        "gradient_mean",
+        "connectivity_mean",
+        "dtssd_mean",
+    )
+    fields = [
+        "run_label",
+        "created_utc",
+        "temporal_model",
+        "stability_preset",
+        "start_frame",
+        "end_frame",
+        "object_id",
+        *[f"temporal_{name}" for name in metric_names],
+        *[f"final_{name}" for name in metric_names],
+        *[f"delta_{name}" for name in metric_names],
+    ]
+    write_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        if write_header:
+            writer.writeheader()
+        for item in ground_truth["objects"]:
+            temporal = item["temporal"]["aggregate"]
+            final = item["final"]["aggregate"]
+            delta = item["final_minus_temporal"]
+            row = {
+                "run_label": report["run_label"],
+                "created_utc": report["created_utc"],
+                "temporal_model": report["settings"].get("temporal_model"),
+                "stability_preset": report["settings"].get("stability_preset"),
+                "start_frame": report["frame_range"][0],
+                "end_frame": report["frame_range"][1],
+                "object_id": item["object_id"],
+            }
+            for name in metric_names:
+                row[f"temporal_{name}"] = temporal[name]
+                row[f"final_{name}"] = final[name]
+                row[f"delta_{name}"] = delta[name]
+            writer.writerow(row)
+
+
 def evaluate_hybrid_run(
     *,
     frames_dir: str | os.PathLike,
@@ -228,6 +281,9 @@ def evaluate_hybrid_run(
     frame_extension: str,
     run_label: str,
     settings: dict,
+    ground_truth_dir: str | os.PathLike | None = None,
+    source_frame_numbers: list[int] | None = None,
+    source_frame_padding: int = 0,
     flow_resolution: int = 720,
     progress_callback: ProgressCallback | None = None,
     cancel_callback: CancelCallback | None = None,
@@ -436,12 +492,54 @@ def evaluate_hybrid_run(
                 )
             completed += 1
 
+        ground_truth_metrics = None
+        if ground_truth_dir:
+            update("Evaluating ground-truth alpha mattes")
+            ground_truth_metrics = evaluate_ground_truth(
+                final_dir=mattes_path,
+                temporal_dir=temporal_path,
+                ground_truth_dir=ground_truth_dir,
+                frame_range=(start_frame, end_frame),
+                object_ids=object_ids,
+                source_frame_numbers=source_frame_numbers,
+                source_frame_padding=source_frame_padding,
+            )
+            allow_flat = len(object_ids) == 1
+            for object_id in object_ids:
+                for frame in frames:
+                    source_frame = None
+                    if source_frame_numbers and frame < len(source_frame_numbers):
+                        source_frame = int(source_frame_numbers[frame])
+                    source = resolve_ground_truth_path(
+                        ground_truth_dir,
+                        frame,
+                        object_id,
+                        allow_flat=allow_flat,
+                        source_frame=source_frame,
+                        source_padding=source_frame_padding,
+                    )
+                    destination = (
+                        run_dir
+                        / "ground_truth"
+                        / f"{frame:05d}"
+                        / f"{object_id}{source.suffix.lower()}"
+                    )
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination)
+
         created_utc = datetime.now(timezone.utc).isoformat()
         report = {
-            "phase": "4.3",
-            "metric_type": "no-reference comparative diagnostics",
+            "phase": "4.4" if ground_truth_metrics is not None else "4.3",
+            "metric_type": (
+                "no-reference diagnostics and ground-truth benchmark"
+                if ground_truth_metrics is not None
+                else "no-reference comparative diagnostics"
+            ),
             "ground_truth_notice": (
-                "These values compare final Hybrid HQ alpha with its temporal base. "
+                "Formal SAD, MSE, gradient, connectivity, and dtSSD metrics are "
+                "available in ground_truth_metrics; lower is better."
+                if ground_truth_metrics is not None
+                else "These values compare final Hybrid HQ alpha with its temporal base. "
                 "They are not ground-truth SAD, MSE, gradient, connectivity, or dtSSD scores."
             ),
             "run_label": run_dir.name,
@@ -450,6 +548,8 @@ def evaluate_hybrid_run(
             "settings": dict(settings),
             "objects": [],
         }
+        if ground_truth_metrics is not None:
+            report["ground_truth_metrics"] = ground_truth_metrics
         for object_id in object_ids:
             frame_metrics = objects[int(object_id)]["frame_metrics"]
             pair_metrics = objects[int(object_id)]["pair_metrics"]
@@ -465,6 +565,7 @@ def evaluate_hybrid_run(
         with report_path.open("w", encoding="utf-8") as stream:
             json.dump(report, stream, indent=2)
         _write_summary_csv(output_path, report)
+        _write_ground_truth_summary_csv(output_path, report)
         if progress_callback is not None:
             progress_callback(max(total, 1), max(total, 1), "Evaluation complete")
         return report_path
