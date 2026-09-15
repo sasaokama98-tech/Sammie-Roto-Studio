@@ -18,6 +18,8 @@ class MematteUiTests(unittest.TestCase):
         tab = MattingTab()
         tab.show()
         tab.matany_model_combo.setCurrentText("MEMatte")
+        self.assertFalse(tab.advanced_processing_content.isVisible())
+        tab.advanced_processing_button.setChecked(True)
         self.app.processEvents()
 
         self.assertTrue(tab.mematte_margin_spin.isVisible())
@@ -55,6 +57,8 @@ class MematteUiTests(unittest.TestCase):
         tab = MattingTab()
         tab.show()
         tab.matany_model_combo.setCurrentText("Hybrid HQ")
+        self.assertFalse(tab.advanced_processing_content.isVisible())
+        tab.advanced_processing_button.setChecked(True)
         self.app.processEvents()
 
         self.assertTrue(tab.hybrid_temporal_combo.isVisible())
@@ -71,6 +75,7 @@ class MematteUiTests(unittest.TestCase):
         self.assertTrue(tab.hybrid_ground_truth_edit.isVisible())
         self.assertFalse(tab.hybrid_ground_truth_edit.isEnabled())
         self.assertTrue(tab.performance_metrics_checkbox.isVisible())
+        self.assertFalse(tab.performance_metrics_checkbox.isChecked())
         tab.hybrid_motion_checkbox.setChecked(True)
         self.app.processEvents()
         self.assertTrue(tab.hybrid_flow_resolution_combo.isEnabled())
@@ -89,6 +94,21 @@ class MematteUiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(tab.overlap_combo.isVisible())
         self.assertTrue(tab.chunk_combo.isVisible())
+        tab.close()
+
+    def test_hybrid_temporal_base_is_basic_row_below_model(self):
+        tab = MattingTab()
+        tab.show()
+        tab.matany_model_combo.setCurrentText("Hybrid HQ")
+        self.app.processEvents()
+        self.assertFalse(tab.advanced_processing_content.isVisible())
+        self.assertTrue(tab.hybrid_temporal_row.isVisible())
+        self.assertTrue(tab.hybrid_temporal_combo.isVisible())
+        self.assertLess(tab.matany_model_combo.y(), tab.hybrid_temporal_row.y())
+        self.assertLess(tab.hybrid_temporal_row.y(), tab.combined_mask_checkbox.y())
+        tab.matany_model_combo.setCurrentText("MEMatte")
+        self.app.processEvents()
+        self.assertFalse(tab.hybrid_temporal_row.isVisible())
         tab.close()
 
     def test_processing_settings_use_fixed_rows_inside_scrollable_tab(self):

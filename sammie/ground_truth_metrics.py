@@ -19,6 +19,27 @@ import numpy as np
 GROUND_TRUTH_EXTENSIONS = (".png", ".tif", ".tiff", ".exr")
 
 
+class GroundTruthResolutionMismatchError(ValueError):
+    """Reference and predicted alpha cannot be scored without registration."""
+
+    def __init__(self, *, frame: int, object_id: int, source: Path,
+                 ground_truth_shape: tuple[int, int], matte_shape: tuple[int, int],
+                 matte_name: str):
+        self.frame = frame
+        self.object_id = object_id
+        self.source = source
+        self.ground_truth_shape = ground_truth_shape
+        self.matte_shape = matte_shape
+        gt_height, gt_width = ground_truth_shape
+        matte_height, matte_width = matte_shape
+        super().__init__(
+            f"Ground Truth Alpha resolution {gt_width}x{gt_height} does not match "
+            f"{matte_name} matte/proxy resolution {matte_width}x{matte_height} "
+            f"at frame {frame}, object {object_id}.\n"
+            f"GT: {source}\nNo automatic resize or registration was performed."
+        )
+
+
 def read_alpha(path: str | os.PathLike) -> np.ndarray:
     """Read an alpha image as clipped float32 in the 0..1 range."""
 
@@ -268,6 +289,16 @@ def evaluate_ground_truth(
             temporal = read_alpha(
                 Path(temporal_dir) / f"{frame:05d}" / f"{object_id}.png"
             )
+            for name, prediction in (("final", final), ("temporal", temporal)):
+                if ground_truth.shape != prediction.shape:
+                    raise GroundTruthResolutionMismatchError(
+                        frame=frame,
+                        object_id=object_id,
+                        source=ground_truth_path,
+                        ground_truth_shape=ground_truth.shape,
+                        matte_shape=prediction.shape,
+                        matte_name=name,
+                    )
             for name, prediction in (("final", final), ("temporal", temporal)):
                 metrics = spatial_metrics(prediction, ground_truth)
                 metrics["frame"] = int(frame)

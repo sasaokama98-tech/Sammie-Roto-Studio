@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from sammie.ground_truth_metrics import (
+    GroundTruthResolutionMismatchError,
     connectivity_error,
     dtssd_metric,
     evaluate_ground_truth,
@@ -172,7 +173,9 @@ class GroundTruthMetricTests(unittest.TestCase):
                     str(target / "0.png"), np.zeros(shape, dtype=np.uint8)
                 )
 
-            with self.assertRaisesRegex(ValueError, "does not match"):
+            with self.assertRaisesRegex(
+                GroundTruthResolutionMismatchError, "does not match"
+            ) as caught:
                 evaluate_ground_truth(
                     final_dir=root / "final",
                     temporal_dir=root / "temporal",
@@ -180,6 +183,9 @@ class GroundTruthMetricTests(unittest.TestCase):
                     frame_range=(0, 0),
                     object_ids=[0],
                 )
+            self.assertEqual(caught.exception.ground_truth_shape, (3, 4))
+            self.assertEqual(caught.exception.matte_shape, (4, 4))
+            self.assertIn("No automatic resize", str(caught.exception))
 
     def test_connectivity_rejects_shape_change(self):
         self.assertGreater(

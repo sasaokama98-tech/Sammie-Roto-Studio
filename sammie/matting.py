@@ -6,9 +6,10 @@ import numpy as np
 import torch
 import gc
 from tqdm import tqdm
-from PySide6.QtWidgets import QProgressDialog, QApplication
+from PySide6.QtWidgets import QProgressDialog, QApplication, QMessageBox
 from PySide6.QtCore import Qt
 from sammie import core
+from sammie.auto_pregrade import inference_frames_dir
 from sammie.settings_manager import get_settings_manager
 from sammie.model_downloader import ensure_models
 from sammie.trimap import TrimapConfig, generate_trimap
@@ -32,6 +33,7 @@ from sammie.hybrid_evaluation import (
     HybridEvaluationCancelled,
     evaluate_hybrid_run,
 )
+from sammie.ground_truth_metrics import GroundTruthResolutionMismatchError
 from sammie.performance_metrics import MattingRunProfiler, write_performance_report
 
 
@@ -186,12 +188,24 @@ class MattingManager:
     def _collect_image_paths(self, start_frame, end_frame):
         """Return a list of existing frame image paths in [start_frame, end_frame]."""
         extension = core.get_frame_extension()
+        inference_dir = self._inference_frames_dir()
         images = []
         for frame_number in range(start_frame, end_frame + 1):
-            image_filename = os.path.join(core.frames_dir, f"{frame_number:05d}.{extension}")
+            image_filename = os.path.join(inference_dir, f"{frame_number:05d}.{extension}")
             if os.path.exists(image_filename):
                 images.append(image_filename)
         return images
+
+    def _inference_frames_dir(self):
+        return inference_frames_dir(
+            core.frames_dir, core.temp_dir, core.get_frame_extension().lower(),
+            core.VideoInfo.total_frames, "matting",
+            get_settings_manager().get_session_setting("matting_auto_pregrade_enabled", False),
+        )
+
+    def _inference_frame_path(self, frame_number, extension=None):
+        extension = extension or core.get_frame_extension()
+        return os.path.join(self._inference_frames_dir(), f"{frame_number:05d}.{extension}")
 
     def clear_matting(self):
         """Clear matting data"""
@@ -764,9 +778,7 @@ class VitMatteManager(ImageMattingManager):
                     if progress_dialog.wasCanceled():
                         cancelled = True
                         break
-                    frame_path = os.path.join(
-                        core.frames_dir, f"{frame_number:05d}.{extension}"
-                    )
+                    frame_path = self._inference_frame_path(frame_number, extension)
                     bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
                     if bgr is None:
                         raise OSError(f"Unable to read frame: {frame_path}")
@@ -907,9 +919,7 @@ class MematteManager(ImageMattingManager):
                     if progress_dialog.wasCanceled():
                         cancelled = True
                         break
-                    frame_path = os.path.join(
-                        core.frames_dir, f"{frame_number:05d}.{extension}"
-                    )
+                    frame_path = self._inference_frame_path(frame_number, extension)
                     bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
                     if bgr is None:
                         raise OSError(f"Unable to read frame: {frame_path}")
@@ -1177,9 +1187,7 @@ class HybridHQManager(MattingManager):
 
                     bgr = None
                     if np.any(trimap == 128) or motion_enabled:
-                        frame_path = os.path.join(
-                            core.frames_dir, f"{frame_number:05d}.{extension}"
-                        )
+                        frame_path = self._inference_frame_path(frame_number, extension)
                         bgr = cv2.imread(frame_path, cv2.IMREAD_COLOR)
                         if bgr is None:
                             raise OSError(f"Unable to read frame: {frame_path}")
@@ -1486,6 +1494,19 @@ class HybridHQManager(MattingManager):
                 f"Hybrid HQ Phase {evaluation_phase} evaluation cancelled; "
                 "mattes were preserved"
             )
+        except GroundTruthResolutionMismatchError as exc:
+            print(
+                f"Hybrid HQ Phase {evaluation_phase} GT scoring skipped; "
+                f"mattes were preserved: {exc}"
+            )
+            if parent_window is not None:
+                QMessageBox.warning(
+                    parent_window,
+                    "Ground Truth Resolution Mismatch",
+                    f"{exc}\n\nGT scoring was skipped. The Hybrid HQ matte is "
+                    "preserved. Use GT alpha at the matte/proxy resolution "
+                    "for a valid comparison.",
+                )
         except Exception as exc:
             print(
                 f"Hybrid HQ Phase {evaluation_phase} evaluation failed; "
@@ -1517,7 +1538,7 @@ class HybridHQManager(MattingManager):
             "memory_profile", "Custom"
         )
         performance_enabled = settings_mgr.get_session_setting(
-            "performance_metrics_enabled", True
+            "performance_metrics_enabled", False
         ) is True
         profiler = MattingRunProfiler(device)
         run_status = "failed"
@@ -1829,7 +1850,7 @@ class VideoMaMaManager(MattingManager):
         mask_frames = []
  
         for frame_num in range(abs_start, abs_end):
-            frame_path = os.path.join(core.frames_dir, f"{frame_num:05d}.{extension}")
+            frame_path = self._inference_frame_path(frame_num, extension)
             if not os.path.exists(frame_path):
                 print(f"Warning: Frame not found: {frame_path}")
                 return [], [], False
@@ -1943,7 +1964,7 @@ class VideoMaMaManager(MattingManager):
         display_update_frequency = settings_mgr.get_app_setting("display_update_frequency", 5)
  
         # Original frame dimensions for restoring output
-        first_frame_path = os.path.join(core.frames_dir, f"{start_frame:05d}.{extension}")
+        first_frame_path = self._inference_frame_path(start_frame, extension)
         first_frame_img = cv2.imread(first_frame_path)
         if first_frame_img is not None:
             original_h, original_w = first_frame_img.shape[:2]

@@ -134,11 +134,24 @@ class SamManager:
                 return
             self.predictor.to(device)
 
+    def _segmentation_inference_dir(self):
+        from sammie.auto_pregrade import inference_frames_dir
+        settings_mgr = get_settings_manager()
+        return inference_frames_dir(
+            core.frames_dir, core.temp_dir, core.get_frame_extension().lower(),
+            core.VideoInfo.total_frames, "segmentation",
+            settings_mgr.get_session_setting("segmentation_auto_pregrade_enabled", False),
+        )
+
     def initialize_predictor(self):
+        inference_dir = self._segmentation_inference_dir()
+        settings_mgr = get_settings_manager()
+        self._pregrade_enabled_at_init = settings_mgr.get_session_setting(
+            "segmentation_auto_pregrade_enabled", False
+        )
         if self.sam31_backend is not None:
             self.sam31_backend.frame_extension = core.get_frame_extension().lower()
-            self.sam31_backend.start_session(core.frames_dir)
-            settings_mgr = get_settings_manager()
+            self.sam31_backend.start_session(inference_dir)
             self.sam31_backend.configure_prompt_seed(
                 {
                     "text": settings_mgr.get_session_setting(
@@ -155,7 +168,7 @@ class SamManager:
             self.inference_state = {"session_id": self.sam31_backend.session_id}
             return
         self.inference_state = self.predictor.init_state(
-            video_path=core.frames_dir, async_loading_frames=True, offload_video_to_cpu=True
+            video_path=inference_dir, async_loading_frames=True, offload_video_to_cpu=True
         )
 
     def _clear_frame_if_tracked(self, object_id, frame_number):
@@ -641,7 +654,7 @@ class SamManager:
                 device=device,
             )
             fallback_state = fallback_predictor.init_state(
-                video_path=core.frames_dir,
+                video_path=self._segmentation_inference_dir(),
                 async_loading_frames=True,
                 offload_video_to_cpu=True,
             )
@@ -672,7 +685,7 @@ class SamManager:
 
             self.sam31_backend = sam31_backend
             self.predictor = sam31_backend.load()
-            sam31_backend.start_session(core.frames_dir)
+            sam31_backend.start_session(self._segmentation_inference_dir())
             self.inference_state = {"session_id": sam31_backend.session_id}
             self._replay_sam31_points(points_list, save_masks=False)
 

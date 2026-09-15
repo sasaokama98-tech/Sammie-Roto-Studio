@@ -204,7 +204,8 @@ class SegmentationTab(QWidget):
     def _create_model_selection_group(self, layout):
         """Create the Model Selection group"""
         model_group = QGroupBox("Model Selection")
-        model_layout_row = QHBoxLayout(model_group)
+        model_layout = QVBoxLayout(model_group)
+        model_layout_row = QHBoxLayout()
         
         settings_mgr = get_settings_manager()
         settings_mgr.get_session_setting("default_sam_model", "Base")
@@ -222,6 +223,25 @@ class SegmentationTab(QWidget):
 
         model_layout_row.addWidget(self.sam_model_combo)
         model_layout_row.addWidget(self.sam_model_btn)
+        model_layout.addLayout(model_layout_row)
+        self.segmentation_pregrade_checkbox = QCheckBox(
+            "Auto Pregrade for Segmentation (inference only)"
+        )
+        self.segmentation_pregrade_checkbox.setChecked(
+            settings_mgr.get_session_setting("segmentation_auto_pregrade_enabled", False)
+        )
+        self.segmentation_pregrade_checkbox.setToolTip(
+            "Shot-wide exposure/contrast correction for model input only. "
+            "Reload the segmentation model after changing this setting. "
+            "Original frames and exports are unchanged."
+            " Pregraded frames are cached under temp/auto_pregrade_frames."
+        )
+        self.segmentation_pregrade_checkbox.toggled.connect(
+            lambda enabled: settings_mgr.set_session_setting(
+                "segmentation_auto_pregrade_enabled", enabled
+            )
+        )
+        model_layout.addWidget(self.segmentation_pregrade_checkbox)
         
         layout.addWidget(model_group)
 
@@ -582,6 +602,9 @@ class SegmentationTab(QWidget):
             self.sam_model_combo.setCurrentIndex(2)
         elif model == "SAM 3.1":
             self.sam_model_combo.setCurrentIndex(3)
+        self.segmentation_pregrade_checkbox.setChecked(
+            settings_mgr.get_session_setting("segmentation_auto_pregrade_enabled", False)
+        )
 
         prompt_text = settings_mgr.get_session_setting("sam31_prompt_text", "")
         self.sam31_prompt_edit.setText(prompt_text)
@@ -677,7 +700,7 @@ class MattingTab(QWidget):
         )
         self.performance_metrics_checkbox.setChecked(
             settings_mgr.get_session_setting(
-                "performance_metrics_enabled", True
+                "performance_metrics_enabled", False
             )
         )
         self.performance_metrics_checkbox.setToolTip(
@@ -724,6 +747,18 @@ class MattingTab(QWidget):
 
         self.combined_mask_checkbox = QCheckBox("Combine All Objects")
         self.combined_mask_checkbox.setToolTip("If checked, all objects will be merged and processed as a single object.")
+        self.matting_pregrade_checkbox = QCheckBox(
+            "Auto Pregrade for Matting (inference only)"
+        )
+        self.matting_pregrade_checkbox.setChecked(
+            settings_mgr.get_session_setting("matting_auto_pregrade_enabled", False)
+        )
+        self.matting_pregrade_checkbox.setToolTip(
+            "Apply one conservative exposure/contrast adjustment across the "
+            "sequence before model inference. Original footage and exported "
+            "mattes are not color-graded."
+            " Pregraded frames are cached under temp/auto_pregrade_frames."
+        )
 
         self.trimap_auto_checkbox = QCheckBox("Automatic Trimap Width")
         self.trimap_auto_checkbox.setChecked(
@@ -920,6 +955,7 @@ class MattingTab(QWidget):
             self.overlap_combo,
             self.chunk_combo,
             self.combined_mask_checkbox,
+            self.matting_pregrade_checkbox,
             self.trimap_auto_checkbox,
             self.trimap_fg_spin,
             self.trimap_bg_spin,
@@ -966,22 +1002,20 @@ class MattingTab(QWidget):
         trimap_layout.addWidget(self.mematte_tokens_spin, 9, 1)
         trimap_layout.addWidget(self.mematte_precision_label, 10, 0)
         trimap_layout.addWidget(self.mematte_precision_combo, 10, 1)
-        trimap_layout.addWidget(self.hybrid_temporal_label, 11, 0)
-        trimap_layout.addWidget(self.hybrid_temporal_combo, 11, 1)
-        trimap_layout.addWidget(self.hybrid_stability_label, 12, 0)
-        trimap_layout.addWidget(self.hybrid_stability_combo, 12, 1)
-        trimap_layout.addWidget(self.hybrid_motion_checkbox, 13, 0, 1, 2)
-        trimap_layout.addWidget(self.hybrid_flow_resolution_label, 14, 0)
-        trimap_layout.addWidget(self.hybrid_flow_resolution_combo, 14, 1)
-        trimap_layout.addWidget(self.hybrid_evaluation_checkbox, 15, 0, 1, 2)
-        trimap_layout.addWidget(self.hybrid_evaluation_label, 16, 0)
-        trimap_layout.addWidget(self.hybrid_evaluation_edit, 16, 1)
-        trimap_layout.addWidget(self.hybrid_ground_truth_label, 17, 0)
-        trimap_layout.addLayout(self.hybrid_ground_truth_row, 17, 1)
-        trimap_layout.addWidget(self.hybrid_edge_label, 18, 0)
-        trimap_layout.addWidget(self.hybrid_edge_spin, 18, 1)
-        trimap_layout.addWidget(self.hybrid_feather_label, 19, 0)
-        trimap_layout.addWidget(self.hybrid_feather_spin, 19, 1)
+        trimap_layout.addWidget(self.hybrid_stability_label, 11, 0)
+        trimap_layout.addWidget(self.hybrid_stability_combo, 11, 1)
+        trimap_layout.addWidget(self.hybrid_motion_checkbox, 12, 0, 1, 2)
+        trimap_layout.addWidget(self.hybrid_flow_resolution_label, 13, 0)
+        trimap_layout.addWidget(self.hybrid_flow_resolution_combo, 13, 1)
+        trimap_layout.addWidget(self.hybrid_evaluation_checkbox, 14, 0, 1, 2)
+        trimap_layout.addWidget(self.hybrid_evaluation_label, 15, 0)
+        trimap_layout.addWidget(self.hybrid_evaluation_edit, 15, 1)
+        trimap_layout.addWidget(self.hybrid_ground_truth_label, 16, 0)
+        trimap_layout.addLayout(self.hybrid_ground_truth_row, 16, 1)
+        trimap_layout.addWidget(self.hybrid_edge_label, 17, 0)
+        trimap_layout.addWidget(self.hybrid_edge_spin, 17, 1)
+        trimap_layout.addWidget(self.hybrid_feather_label, 18, 0)
+        trimap_layout.addWidget(self.hybrid_feather_spin, 18, 1)
 
         # Connect to save settings when changed
         self.matany_model_combo.currentTextChanged.connect(self._save_model_setting)
@@ -994,6 +1028,11 @@ class MattingTab(QWidget):
         )
         self.combined_mask_checkbox.stateChanged.connect(
             lambda state: settings_mgr.set_session_setting("matany_combined", self.combined_mask_checkbox.isChecked())
+        )
+        self.matting_pregrade_checkbox.toggled.connect(
+            lambda enabled: settings_mgr.set_session_setting(
+                "matting_auto_pregrade_enabled", enabled
+            )
         )
         self.trimap_auto_checkbox.stateChanged.connect(self._save_trimap_settings)
         self.trimap_fg_spin.valueChanged.connect(self._save_trimap_settings)
@@ -1076,13 +1115,39 @@ class MattingTab(QWidget):
         chunk_layout.addStretch()
         
         processing_layout.addLayout(memory_layout)
-        processing_layout.addWidget(self.performance_metrics_checkbox)
         processing_layout.addLayout(model_layout)
-        processing_layout.addLayout(res_layout)
-        processing_layout.addLayout(overlap_layout)
-        processing_layout.addLayout(chunk_layout)
+        self.hybrid_temporal_row = QWidget()
+        self.hybrid_temporal_row.setFixedHeight(26)
+        temporal_row_layout = QHBoxLayout(self.hybrid_temporal_row)
+        temporal_row_layout.setContentsMargins(0, 0, 0, 0)
+        temporal_row_layout.addWidget(self.hybrid_temporal_label)
+        temporal_row_layout.addWidget(self.hybrid_temporal_combo)
+        temporal_row_layout.addStretch()
+        processing_layout.addWidget(self.hybrid_temporal_row)
+        self.hybrid_temporal_row.setVisible(False)
         processing_layout.addWidget(self.combined_mask_checkbox)
-        processing_layout.addLayout(trimap_layout)
+        processing_layout.addWidget(self.matting_pregrade_checkbox)
+        self.advanced_processing_button = QPushButton("Advanced Processing ▸")
+        self.advanced_processing_button.setCheckable(True)
+        self.advanced_processing_button.toggled.connect(
+            lambda opened: self.advanced_processing_button.setText(
+                "Advanced Processing ▾" if opened else "Advanced Processing ▸"
+            )
+        )
+        processing_layout.addWidget(self.advanced_processing_button)
+        self.advanced_processing_content = QWidget()
+        advanced_layout = QVBoxLayout(self.advanced_processing_content)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_layout.addLayout(res_layout)
+        advanced_layout.addLayout(overlap_layout)
+        advanced_layout.addLayout(chunk_layout)
+        advanced_layout.addLayout(trimap_layout)
+        advanced_layout.addWidget(self.performance_metrics_checkbox)
+        processing_layout.addWidget(self.advanced_processing_content)
+        self.advanced_processing_content.setVisible(False)
+        self.advanced_processing_button.toggled.connect(
+            self.advanced_processing_content.setVisible
+        )
         layout.addWidget(self.processing_group)
 
         if memory_profile != CUSTOM_MEMORY_PROFILE:
@@ -1283,6 +1348,7 @@ class MattingTab(QWidget):
         self.mematte_precision_label.setVisible(is_mematte)
         self.mematte_precision_combo.setVisible(is_mematte)
         is_hybrid = value == "Hybrid HQ"
+        self.hybrid_temporal_row.setVisible(is_hybrid)
         self.hybrid_temporal_label.setVisible(is_hybrid)
         self.hybrid_temporal_combo.setVisible(is_hybrid)
         self.hybrid_stability_label.setVisible(is_hybrid)
@@ -1551,7 +1617,10 @@ class MattingTab(QWidget):
             settings_mgr.get_session_setting("hybrid_edge_feather", 4)
         )
         self.performance_metrics_checkbox.setChecked(
-            settings_mgr.get_session_setting("performance_metrics_enabled", True)
+            settings_mgr.get_session_setting("performance_metrics_enabled", False)
+        )
+        self.matting_pregrade_checkbox.setChecked(
+            settings_mgr.get_session_setting("matting_auto_pregrade_enabled", False)
         )
         memory_profile = settings_mgr.get_session_setting(
             "memory_profile", CUSTOM_MEMORY_PROFILE
@@ -3536,7 +3605,12 @@ class MainWindow(QMainWindow):
     def load_segmentation_model(self):
         """Load a new SAM model"""
         model = self.segmentation_tab.sam_model_combo.currentText()
-        if model == self.sam_manager.loaded_model_name:
+        grade_enabled = self.settings_mgr.get_session_setting(
+            "segmentation_auto_pregrade_enabled", False
+        )
+        if (model == self.sam_manager.loaded_model_name and
+                self.sam_manager.inference_state is not None and
+                grade_enabled == getattr(self.sam_manager, "_pregrade_enabled_at_init", None)):
             print("Model is already loaded")
             return
 

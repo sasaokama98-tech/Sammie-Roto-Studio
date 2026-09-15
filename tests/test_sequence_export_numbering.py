@@ -83,12 +83,18 @@ class SequenceExportNumberingTests(unittest.TestCase):
             dialog.sequence_start_spin.setValue(1001)
             self.app.processEvents()
 
+            self.assertFalse(dialog.advanced_export_content.isVisibleTo(dialog))
+            self.assertFalse(dialog.save_settings_btn.isVisibleTo(dialog))
             self.assertTrue(dialog.sequence_start_spin.isVisibleTo(dialog))
             self.assertIn(".1001.png", dialog.filename_preview_label.text())
             self.assertIn(".1003.png", dialog.filename_preview_label.text())
             self.assertEqual(
                 dialog._build_export_settings().sequence_start_number, 1001
             )
+            dialog.advanced_export_button.setChecked(True)
+            self.app.processEvents()
+            self.assertTrue(dialog.save_settings_btn.isVisibleTo(dialog))
+            self.assertTrue(dialog.object_id_combo.isVisibleTo(dialog))
 
             prores_index = dialog.format_combo.findData("prores")
             dialog.format_combo.setCurrentIndex(prores_index)

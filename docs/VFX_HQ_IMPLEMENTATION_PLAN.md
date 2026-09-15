@@ -201,6 +201,27 @@ Pending validation:
 
 See `PHASE5_MEMORY_PROFILES.md` for the exact profile matrix.
 
+## Phase 6 — Everyday workflow and inference-only pregrade (implemented)
+
+- Sequence-wide neutral pregrade is estimated from sampled frame luminance and
+  staged for Segmentation or Matting inference when explicitly enabled. A
+  single bounded transform avoids per-frame exposure flicker. Original footage,
+  GUI preview, evaluation source frames, and exported RGB are not graded;
+  segmentation and matte alpha may change when the option is enabled.
+- Auto Pregrade toggles remain basic controls; trimap, ROI, Hybrid, evaluation,
+  and performance settings are hidden in collapsed Advanced Processing.
+- Export retains the full format/backend behavior, but its basic view shows
+  only output location/name, format/type, range, and sequence start frame.
+  Object splits, tags, codec quality, and other options are in Advanced Export.
+- New sessions disable evaluation archiving and performance reports by default.
+  Legacy always-on performance defaults migrate off once. Explicit opt-ins
+  made after migration persist, and legacy evaluation archive choices remain.
+
+GT scoring intentionally retains exact frame-name/layout and same-resolution
+requirements. Prefixed EXR name inference and GT/proxy registration are not
+planned. A resolution mismatch now produces a warning rather than a silent
+optional-evaluation failure; the completed Hybrid HQ matte is retained.
+
 ### Phase 5.1 — Performance telemetry (implemented)
 
 - Hybrid HQ records temporal, MEMatte edge, and optional evaluation stages

@@ -108,6 +108,10 @@ same-resolution alpha for every evaluated frame and object. It evaluates both
 the temporal base and final Hybrid matte, so the report shows whether MEMatte
 refinement improved or regressed each metric. Missing or mismatched ground
 truth fails only the optional evaluation stage; completed mattes are preserved.
+If GT and matte/proxy resolutions differ, Studio warns with both dimensions,
+the frame, object, and GT path. It skips scoring without automatically resizing
+or registering the reference. Prefixed EXR names are not inferred; use the
+documented frame/object naming layout for GT evaluation.
 
 The run additionally contains:
 

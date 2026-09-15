@@ -48,12 +48,31 @@ no-reference boundary and flow-warped comparison metrics plus a summary CSV.
 Phase 4.4 optionally scores both the temporal base and final Hybrid matte
 against a complete ground-truth alpha sequence with SAD, MSE, gradient,
 connectivity, and dtSSD metrics. Ground-truth evaluation remains opt-in and
-does not change normal Hybrid HQ processing.
+does not change normal Hybrid HQ processing. GT and matte/proxy resolutions
+must match; a mismatch warns and skips scoring without resampling.
 Controls and processing semantics are documented in
 [`docs/PHASE4_HYBRID_HQ.md`](docs/PHASE4_HYBRID_HQ.md).
 Memory Safe, Balanced, Fast, and automatically preserved Custom policies are
 documented in
 [`docs/PHASE5_MEMORY_PROFILES.md`](docs/PHASE5_MEMORY_PROFILES.md).
+
+## Everyday workflow
+
+Segmentation and Matting each have an optional Auto Pregrade checkbox beside
+the model controls. When enabled, Studio estimates a single bounded exposure/
+contrast correction from the sequence and stages corrected frames for model
+inference only. Source and exported RGB pixels are not graded; predicted matte
+alpha can change. Reload the segmentation model after changing its pregrade setting;
+the matting setting applies on the next run. Both switches are off by default.
+
+Detailed matting controls, global defaults, and export options now sit behind
+collapsed Advanced Processing/Advanced Defaults/Advanced Export sections. The
+basic export view retains output
+folder/name, format, output type, In/Out range, and sequence start number. New
+sessions do not save Hybrid evaluation archives or performance reports unless
+those diagnostics are explicitly enabled under Advanced Processing. Existing
+sessions retain evaluation archive choices; the old always-on performance
+default migrates to off once, while future explicit opt-ins remain saved.
 
 The integrated installer/updater follows this Studio repository and keeps the
 SAM 3.1, ViTMatte, and MEMatte runtime extras installed. Studio version

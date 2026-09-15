@@ -11,6 +11,7 @@ from sammie.memory_profiles import BALANCED, CUSTOM, get_memory_profile
 @dataclass
 class ApplicationSettings:
     """Global application settings that persist across sessions"""
+    workflow_diagnostics_version: int = 1
     # UI Layout
     main_splitter_sizes: list = field(default_factory=lambda: [1000, 300])
     vertical_splitter_sizes: list = field(default_factory=lambda: [600, 208])
@@ -34,6 +35,7 @@ class ApplicationSettings:
     
     # Segmentation Processing defaults
     default_sam_model: str = "Base"
+    default_segmentation_auto_pregrade_enabled: bool = False
     default_holes: int = 0
     default_dots: int = 0
     default_border_fix: int = 0
@@ -44,6 +46,7 @@ class ApplicationSettings:
     default_matany_grow: int = 0
     default_matany_gamma: float = 1.0
     default_matany_model: str = "MatAnyone2"
+    default_matting_auto_pregrade_enabled: bool = False
     default_matany_res: int = 720
     default_matany_overlap: int = 2
     default_matany_chunk: int = 16
@@ -67,7 +70,7 @@ class ApplicationSettings:
     default_hybrid_edge_width: int = 12
     default_hybrid_edge_feather: int = 4
     default_memory_profile: str = BALANCED
-    default_performance_metrics_enabled: bool = True
+    default_performance_metrics_enabled: bool = False
 
     # Object Removal Processing defaults
     default_removal_method: str = "MiniMax-Remover"
@@ -105,6 +108,7 @@ class ApplicationSettings:
 @dataclass  
 class SessionSettings:
     """Session-specific settings that are saved with each video/project"""
+    workflow_diagnostics_version: int = 1
     # Video information
     video_file_path: str = ""
     frame_format: str = "png"
@@ -136,6 +140,7 @@ class SessionSettings:
     
     # Segmentation parameters
     sam_model: str = "Base"
+    segmentation_auto_pregrade_enabled: bool = False
     sam31_prompt_text: str = ""
     sam31_prompt_frame: int = None
     sam31_prompt_mappings: list = field(default_factory=list)
@@ -148,6 +153,7 @@ class SessionSettings:
     matany_grow: int = 0
     matany_gamma: float = 1.0
     matany_model: str = "MatAnyone2"
+    matting_auto_pregrade_enabled: bool = False
     matany_res: int = 1080
     matany_overlap: int = 2
     matany_chunk: int = 16
@@ -173,7 +179,7 @@ class SessionSettings:
     hybrid_edge_width: int = 12
     hybrid_edge_feather: int = 4
     memory_profile: str = CUSTOM
-    performance_metrics_enabled: bool = True
+    performance_metrics_enabled: bool = False
 
     # Object removal parameters
     removal_method: str = "MiniMax-Remover"
@@ -240,6 +246,11 @@ class SettingsManager:
                     for key, value in data.items():
                         if hasattr(self.app_settings, key):
                             setattr(self.app_settings, key, value)
+                    if data.get("workflow_diagnostics_version", 0) < 1:
+                        # Older builds recorded metrics by default. Do not
+                        # silently keep that default behind collapsed controls.
+                        self.app_settings.default_performance_metrics_enabled = False
+                        self.app_settings.workflow_diagnostics_version = 1
                 #print("Application settings loaded")
                 return True
         except Exception as e:
@@ -280,6 +291,9 @@ class SettingsManager:
                     for key, value in data.items():
                         if hasattr(self.session_settings, key):
                             setattr(self.session_settings, key, value)
+                    if data.get("workflow_diagnostics_version", 0) < 1:
+                        self.session_settings.performance_metrics_enabled = False
+                        self.session_settings.workflow_diagnostics_version = 1
                 return True
         except Exception as e:
             print(f"Error loading session settings: {e}")
@@ -336,6 +350,8 @@ class SettingsManager:
             matany_grow=self.app_settings.default_matany_grow,
             matany_gamma=self.app_settings.default_matany_gamma,
             matany_model=self.app_settings.default_matany_model,
+            segmentation_auto_pregrade_enabled=self.app_settings.default_segmentation_auto_pregrade_enabled,
+            matting_auto_pregrade_enabled=self.app_settings.default_matting_auto_pregrade_enabled,
             matany_res = self.app_settings.default_matany_res,
             matany_overlap=self.app_settings.default_matany_overlap,
             matany_chunk=self.app_settings.default_matany_chunk,

@@ -8,7 +8,7 @@ import datetime
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QPushButton, QLabel, QLineEdit, QComboBox, QSpinBox, QCheckBox,
-    QFileDialog, QProgressDialog, QMessageBox
+    QFileDialog, QProgressDialog, QMessageBox, QScrollArea, QWidget
 )
 from PySide6.QtCore import Qt
 from sammie.core import VideoInfo
@@ -112,7 +112,7 @@ class ExportDialog(QDialog):
         
         self.setWindowTitle("Export Video")
         self.setModal(True)
-        self.resize(500, 520)
+        self.resize(540, 520)
         
         self._init_ui()
         self._load_saved_settings()
@@ -120,9 +120,16 @@ class ExportDialog(QDialog):
     def _init_ui(self):
         """Initialize dialog UI"""
         layout = QVBoxLayout(self)
-        
-        self._create_output_section(layout)
-        self._create_settings_section(layout)
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setWidgetResizable(True)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        self.content_scroll.setWidget(content)
+        layout.addWidget(self.content_scroll)
+
+        self._create_output_section(content_layout)
+        self._create_settings_section(content_layout)
+        content_layout.addStretch()
         self._create_buttons(layout)
         
         # Set initial format
@@ -166,7 +173,6 @@ class ExportDialog(QDialog):
             "{codec}", "{in_point}", "{out_point}", "{date}", "{time}", "{datetime}"
         ])
         self.tag_dropdown.currentIndexChanged.connect(self._insert_tag)
-        template_layout.addWidget(self.tag_dropdown)
         
         output_layout.addRow("Filename:", template_layout)
         
@@ -180,8 +186,11 @@ class ExportDialog(QDialog):
     
     def _create_settings_section(self, layout):
         """Create export settings section"""
-        settings_group = QGroupBox("Format & Settings")
+        settings_group = QGroupBox("Basic Export")
         settings_layout = QFormLayout(settings_group)
+        self.advanced_export_content = QWidget()
+        advanced_layout = QFormLayout(self.advanced_export_content)
+        advanced_layout.addRow("Insert Filename Tag:", self.tag_dropdown)
         
         # Format selection
         self.format_combo = QComboBox()
@@ -199,30 +208,30 @@ class ExportDialog(QDialog):
         self.object_id_combo = QComboBox()
         self.object_id_combo.addItem("All Objects", -1)
         self.object_id_combo.currentIndexChanged.connect(self._update_filename_preview)
-        settings_layout.addRow("Export Object:", self.object_id_combo)
+        advanced_layout.addRow("Export Object:", self.object_id_combo)
         
         # Export multiple objects checkbox
         self.export_multiple_checkbox = QCheckBox("Export separate file for each object")
         self.export_multiple_checkbox.stateChanged.connect(self._on_export_multiple_changed)
-        settings_layout.addRow("", self.export_multiple_checkbox)
+        advanced_layout.addRow("", self.export_multiple_checkbox)
         
         # Quality setting
         self.quantizer_spin = QSpinBox()
         self.quantizer_spin.setRange(0, 51)
         self.quantizer_spin.setValue(14)
         self.quantizer_spin.setToolTip("Lower values = higher quality, larger file size")
-        settings_layout.addRow("Quality (CRF):", self.quantizer_spin)
-        self.quantizer_label = settings_layout.labelForField(self.quantizer_spin)
+        advanced_layout.addRow("Quality (CRF):", self.quantizer_spin)
+        self.quantizer_label = advanced_layout.labelForField(self.quantizer_spin)
         
         # Antialiasing
         self.antialias_checkbox = QCheckBox("Antialiasing")
         self.antialias_checkbox.setChecked(False)
-        settings_layout.addRow("", self.antialias_checkbox)
+        advanced_layout.addRow("", self.antialias_checkbox)
         
         # Include original (EXR only)
         self.include_original_checkbox = QCheckBox("Include original frame as layer")
         self.include_original_checkbox.setVisible(False)
-        settings_layout.addRow("", self.include_original_checkbox)
+        advanced_layout.addRow("", self.include_original_checkbox)
         
         # In/Out points
         self.use_inout_checkbox = QCheckBox("Export only between in/out markers")
@@ -244,6 +253,17 @@ class ExportDialog(QDialog):
         )
         
         layout.addWidget(settings_group)
+        self.advanced_export_button = QPushButton("Advanced Export ▸")
+        self.advanced_export_button.setCheckable(True)
+        self.advanced_export_button.toggled.connect(
+            lambda opened: self.advanced_export_button.setText(
+                "Advanced Export ▾" if opened else "Advanced Export ▸"
+            )
+        )
+        layout.addWidget(self.advanced_export_button)
+        layout.addWidget(self.advanced_export_content)
+        self.advanced_export_content.setVisible(False)
+        self.advanced_export_button.toggled.connect(self.advanced_export_content.setVisible)
     
     def _create_buttons(self, layout):
         """Create dialog buttons"""
@@ -251,7 +271,7 @@ class ExportDialog(QDialog):
         
         self.save_settings_btn = QPushButton("Save Settings")
         self.save_settings_btn.clicked.connect(self._save_current_settings)
-        button_layout.addWidget(self.save_settings_btn)
+        self.advanced_export_content.layout().addRow("", self.save_settings_btn)
         
         button_layout.addStretch()
         

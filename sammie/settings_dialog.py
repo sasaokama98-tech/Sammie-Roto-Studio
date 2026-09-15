@@ -79,6 +79,9 @@ class SettingsDialog(QDialog):
         """Create the defaults settings tab"""
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        self.advanced_defaults_content = QWidget()
+        advanced_defaults_layout = QVBoxLayout(self.advanced_defaults_content)
+        advanced_defaults_layout.setContentsMargins(0, 0, 0, 0)
 
         # View defaults group
         view_group = QGroupBox("View Defaults")
@@ -118,11 +121,13 @@ class SettingsDialog(QDialog):
         self.default_grow_spin.setRange(-20, 20)
         proc_layout.addRow("Default Shrink/Grow:", self.default_grow_spin)
         
-        layout.addWidget(proc_group)
+        advanced_defaults_layout.addWidget(proc_group)
         
         # Matting defaults group
         mat_group = QGroupBox("Matting Defaults")
         mat_layout = QFormLayout(mat_group)
+        advanced_mat_group = QGroupBox("Detailed Matting Defaults")
+        advanced_mat_layout = QFormLayout(advanced_mat_group)
 
         # Matting model selection
         self.default_matting_model_combo = QComboBox()
@@ -155,7 +160,7 @@ class SettingsDialog(QDialog):
         self.default_performance_metrics_checkbox.setToolTip(
             "Record Hybrid HQ stage time and CUDA peak memory for new sessions."
         )
-        mat_layout.addRow(
+        advanced_mat_layout.addRow(
             "Record Performance Metrics:",
             self.default_performance_metrics_checkbox,
         )
@@ -163,7 +168,7 @@ class SettingsDialog(QDialog):
         # Matting Internal Resolution selection
         self.default_matany_res_combo = QComboBox()
         self.default_matany_res_combo.addItems(["352", "480", "576", "720", "1080", "1440", "2160", "Full"])
-        mat_layout.addRow("Matting Internal Resolution:", self.default_matany_res_combo)
+        advanced_mat_layout.addRow("Matting Internal Resolution:", self.default_matany_res_combo)
 
         # VideoMaMa overlap size
         self.default_matany_overlap_combo = QComboBox()
@@ -171,13 +176,13 @@ class SettingsDialog(QDialog):
         self.default_matany_overlap_combo.setToolTip(
             "Number of overlapping frames between batches (VideoMaMa only)."
         )
-        mat_layout.addRow("Overlap Frames:", self.default_matany_overlap_combo)
+        advanced_mat_layout.addRow("Overlap Frames:", self.default_matany_overlap_combo)
 
         # VideoMaMa chunk size
         self.default_matany_chunk_combo = QComboBox()
         self.default_matany_chunk_combo.addItems(["16", "32", "64", "128", "256", "512"])
         self.default_matany_chunk_combo.setToolTip("Number of frames per batch (VideoMaMa only).")
-        mat_layout.addRow("Frames per batch:", self.default_matany_chunk_combo)
+        advanced_mat_layout.addRow("Frames per batch:", self.default_matany_chunk_combo)
 
         self.default_hybrid_stability_combo = QComboBox()
         self.default_hybrid_stability_combo.addItems(
@@ -186,7 +191,7 @@ class SettingsDialog(QDialog):
         self.default_hybrid_stability_combo.setToolTip(
             "Default temporal-protection level for new Hybrid HQ sessions."
         )
-        mat_layout.addRow(
+        advanced_mat_layout.addRow(
             "Hybrid Stability:", self.default_hybrid_stability_combo
         )
 
@@ -194,13 +199,13 @@ class SettingsDialog(QDialog):
         self.default_hybrid_motion_checkbox.setToolTip(
             "Enable experimental bidirectional optical-flow confidence for new sessions."
         )
-        mat_layout.addRow(
+        advanced_mat_layout.addRow(
             "Hybrid Motion Confidence:", self.default_hybrid_motion_checkbox
         )
 
         self.default_hybrid_flow_resolution_combo = QComboBox()
         self.default_hybrid_flow_resolution_combo.addItems(["480", "720", "1080"])
-        mat_layout.addRow(
+        advanced_mat_layout.addRow(
             "Hybrid Flow Resolution:", self.default_hybrid_flow_resolution_combo
         )
 
@@ -209,7 +214,7 @@ class SettingsDialog(QDialog):
             "Archive Hybrid HQ temporal/final mattes and calculate Phase 4.3 "
             "no-reference comparison metrics for new sessions."
         )
-        mat_layout.addRow(
+        advanced_mat_layout.addRow(
             "Save Hybrid Evaluation:", self.default_hybrid_evaluation_checkbox
         )
 
@@ -221,13 +226,14 @@ class SettingsDialog(QDialog):
         self.default_matany_gamma_spin.setRange(0.1, 10.0)
         self.default_matany_gamma_spin.setSingleStep(0.1)
         self.default_matany_gamma_spin.setDecimals(1)
-        mat_layout.addRow("Default Gamma:", self.default_matany_gamma_spin)
+        advanced_mat_layout.addRow("Default Gamma:", self.default_matany_gamma_spin)
         
         self.default_matany_grow_spin = QSpinBox()
         self.default_matany_grow_spin.setRange(-20, 20)
-        mat_layout.addRow("Default Shrink/Grow:", self.default_matany_grow_spin)
+        advanced_mat_layout.addRow("Default Shrink/Grow:", self.default_matany_grow_spin)
         
         layout.addWidget(mat_group)
+        advanced_defaults_layout.addWidget(advanced_mat_group)
 
         # Object Removal defaults group
         removal_group = QGroupBox("Object Removal Defaults")
@@ -237,7 +243,14 @@ class SettingsDialog(QDialog):
         self.default_inpaint_grow_spin.setRange(-20, 20)
         removal_layout.addRow("Default Shrink/Grow:", self.default_inpaint_grow_spin)
         
-        layout.addWidget(removal_group)
+        advanced_defaults_layout.addWidget(removal_group)
+        self.show_advanced_defaults_checkbox = QCheckBox("Show Advanced Defaults")
+        layout.addWidget(self.show_advanced_defaults_checkbox)
+        layout.addWidget(self.advanced_defaults_content)
+        self.advanced_defaults_content.setVisible(False)
+        self.show_advanced_defaults_checkbox.toggled.connect(
+            self.advanced_defaults_content.setVisible
+        )
         
         return tab
     
